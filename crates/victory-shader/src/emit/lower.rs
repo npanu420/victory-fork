@@ -6319,10 +6319,12 @@ impl<'a> Lower<'a> {
 
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
-        if let Source::Select { args, .. } | Source::Lanes { args, .. } = src {
+        if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
+            src
+        {
             return self.used_kind(args.first()?);
         }
-        if let Source::Phi { args, .. } | Source::LanePhi { args, .. } = src {
+        if let Source::LanePhi { args, .. } = src {
             return args.iter().flatten().find_map(|a| self.used_kind(a));
         }
         if let Source::Built { address, .. } = src {
@@ -6356,159 +6358,9 @@ impl<'a> Lower<'a> {
     }
 
     /// A handle for the descriptor `src` read at `site`.
-    /// Registers an immediate sampler's words and returns its static sampler slot.
-    fn sampler_slot(&mut self, words: &[u32], cmp: bool) -> Result<u32, Why> {
-        let words: [u32; 4] = words
-            .get(..4)
-            .and_then(|w| w.try_into().ok())
-            .ok_or("a sampler constant")?;
-        let n = match self.samplers.iter().position(|w| *w == words) {
-            Some(n) => n,
-            None => {
-                self.samplers.push(words);
-                self.samplers.len() - 1
-            }
-        };
-        if cmp {
-            // shortcut: one sampler used with and without comparison
-            // would need two static samplers; it becomes a comparison one.
-            self.s.cmp_samplers |= 1 << n;
-        }
-        Ok(n as u32)
-    }
-
-    /// Uniform heap index for a descriptor loaded from a heap or chosen by
-    /// uniform control flow (`Phi` / `Select`, arbitrarily nested).
-    fn uniform_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
-        match src {
-            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
-            Source::Select { scc, args } => {
-                let [a, b] = &args[..] else {
-                    return Err("a descriptor chosen by a condition");
-                };
-                let cond = match self.get(*scc)? {
-                    Val::Bit(x) => x,
-                    _ => return Err("SCC without a value"),
-                };
-                let set = self.uniform_heap_index(a, sampler)?;
-                let clear = self.uniform_heap_index(b, sampler)?;
-                Ok(self.s.m.select(self.cur, cond, set, clear))
-            }
-            Source::Phi { block, args } => {
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let Some(tail) = self.tail[q] else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let index = match arg {
-                        Some(arg) => {
-                            let here = std::mem::replace(&mut self.cur, at);
-                            let index = self.uniform_heap_index(arg, sampler);
-                            self.cur = here;
-                            index?
-                        }
-                        None => self.s.m.i32(0),
-                    };
-                    incoming.push((index, at));
-                }
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                Ok(phi)
-            }
-            _ => Err("a descriptor chosen by control flow"),
-        }
-    }
-
-    /// When a sampler is a uniform `Phi`/`Select` whose leaves are all
-    /// immediate `Source::Constant` samplers, returns `(selector_i32, slots)`
-    /// where `selector_i32` picks into `slots`.
-    fn const_sampler_choice(
-        &mut self,
-        src: &Source,
-        cmp: bool,
-    ) -> Option<Result<(V, Vec<u32>), Why>> {
-        if !matches!(src, Source::Phi { .. } | Source::Select { .. }) {
-            return None;
-        }
-        let leaves = src.leaves();
-        if leaves.is_empty() || !leaves.iter().all(|l| matches!(l, Source::Constant(_))) {
-            return None;
-        }
-        let mut slots = Vec::new();
-        Some(
-            self.const_sampler_index(src, cmp, &mut slots)
-                .map(|sel| (sel, slots)),
-        )
-    }
-
-    fn const_sampler_index(
-        &mut self,
-        src: &Source,
-        cmp: bool,
-        slots: &mut Vec<u32>,
-    ) -> Result<V, Why> {
-        match src {
-            Source::Constant(words) => {
-                let slot = self.sampler_slot(words, cmp)?;
-                let pos = match slots.iter().position(|&s| s == slot) {
-                    Some(p) => p,
-                    None => {
-                        slots.push(slot);
-                        slots.len() - 1
-                    }
-                };
-                Ok(self.s.m.i32(pos as u32))
-            }
-            Source::Select { scc, args } => {
-                let [a, b] = &args[..] else {
-                    return Err("a descriptor chosen by a condition");
-                };
-                let cond = match self.get(*scc)? {
-                    Val::Bit(x) => x,
-                    _ => return Err("SCC without a value"),
-                };
-                let set = self.const_sampler_index(a, cmp, slots)?;
-                let clear = self.const_sampler_index(b, cmp, slots)?;
-                Ok(self.s.m.select(self.cur, cond, set, clear))
-            }
-            Source::Phi { block, args } => {
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let Some(tail) = self.tail[q] else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let idx = match arg {
-                        Some(arg) => {
-                            let here = std::mem::replace(&mut self.cur, at);
-                            let idx = self.const_sampler_index(arg, cmp, slots);
-                            self.cur = here;
-                            idx?
-                        }
-                        None => self.s.m.i32(0),
-                    };
-                    incoming.push((idx, at));
-                }
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                Ok(phi)
-            }
-            _ => Err("a descriptor chosen by control flow"),
-        }
-    }
-
     fn handle(
         &mut self,
-        _site: Site,
+        site: Site,
         src: &Source,
         sampler: bool,
         props: (u32, u32),
@@ -6530,8 +6382,23 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Constant(words) if sampler => {
-                let n = self.sampler_slot(words, props.0 & 0x8000 != 0)?;
-                Ok(self.s.sampler_handle(self.cur, n))
+                let words: [u32; 4] = words
+                    .get(..4)
+                    .and_then(|w| w.try_into().ok())
+                    .ok_or("a sampler constant")?;
+                let n = match self.samplers.iter().position(|w| *w == words) {
+                    Some(n) => n,
+                    None => {
+                        self.samplers.push(words);
+                        self.samplers.len() - 1
+                    }
+                };
+                if props.0 & 0x8000 != 0 {
+                    // shortcut: one sampler used with and without comparison
+                    // would need two static samplers; it becomes a comparison one.
+                    self.s.cmp_samplers |= 1 << n;
+                }
+                Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
             Source::Built { address, .. } => {
@@ -6568,8 +6435,27 @@ impl<'a> Lower<'a> {
                     _ => Err("a typed root view"),
                 }
             }
-            Source::Phi { .. } | Source::Select { .. } => {
-                let index = self.uniform_heap_index(src, sampler)?;
+            Source::Phi { block, args } => {
+                let _ = site;
+                let phi = self.descriptor_phi(*block, args, sampler, 8)?;
+                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+            }
+            Source::Select { scc, args } => {
+                // The heap index of each choice, picked by SCC (uniform).
+                let [
+                    Source::Loaded { load: a, first: fa },
+                    Source::Loaded { load: b, first: fb },
+                ] = args[..]
+                else {
+                    return Err("a descriptor chosen by a condition");
+                };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Err("SCC without a value"),
+                };
+                let set = self.heap_index(a, fa, sampler)?;
+                let clear = self.heap_index(b, fb, sampler)?;
+                let index = self.s.m.select(self.cur, cond, set, clear);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
@@ -6580,6 +6466,47 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// The heap index a descriptor phi picks. Each predecessor computes its
+    /// heap index at its end and the join picks one with a phi; a
+    /// predecessor whose descriptor is itself chosen by control flow (a
+    /// phi of an earlier join, which dominates it) gives that join's phi,
+    /// at most `depth` joins deep.
+    fn descriptor_phi(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        sampler: bool,
+        depth: u32,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let p = self.x.p;
+        let mut incoming = Vec::new();
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let index = match arg {
+                Source::Loaded { load, first } => {
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.heap_index(*load, *first, sampler);
+                    self.cur = here;
+                    index?
+                }
+                Source::Phi { block: inner, args: inner_args } if depth > 0 => {
+                    self.descriptor_phi(*inner, inner_args, sampler, depth - 1)?
+                }
+                _ => return Err(WHY),
+            };
+            incoming.push((index, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok(phi)
     }
 
     /// The bytes per element of the buffer view `src` names, if the program
@@ -9834,19 +9761,12 @@ impl<'a> Lower<'a> {
         if uav && op != 66 {
             return Err("sampling a UAV");
         }
-        let Operand::Vector { reg, .. } = *data else {
-            return Err("an image result");
-        };
-        let channels: Vec<u32> = if op == 73 {
-            vec![0, 1, 2, 3]
-        } else {
-            (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
-        };
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
         // A gather at a named level, done as four texel reads (below).
-        let ch_vals: Vec<V> = if sample {
+        let mut gathered: Option<[V; 4]> = None;
+        let r = if sample {
             let ss = self
                 .descriptors
                 .get(&(site, true))
@@ -9858,16 +9778,7 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let const_sampler = self.const_sampler_choice(ss, cmp).transpose()?;
-            let single_sh = match &const_sampler {
-                None => {
-                    Some(self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?)
-                }
-                Some((_, slots)) if slots.len() == 1 => {
-                    Some(self.s.sampler_handle(self.cur, slots[0]))
-                }
-                Some(_) => None,
-            };
+            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -9926,58 +9837,20 @@ impl<'a> Lower<'a> {
             }
             if op == 81 {
                 // The clamped then the unclamped level of detail.
+                let Operand::Vector { reg, .. } = *data else {
+                    return Err("an image result");
+                };
                 let f32t = self.s.t.f32;
-                let lod_chs: Vec<u32> = (0..2u32).filter(|ch| dmask >> ch & 1 != 0).collect();
-                let emit_lods = |s: &mut Shader, blk: usize, sh: V| -> Vec<V> {
-                    lod_chs
-                        .iter()
-                        .map(|&ch| {
-                            let clamped = s.m.bool(ch == 0);
-                            s.op(
-                                blk,
-                                "calculateLOD.f32",
-                                Attr::ReadOnly,
-                                f32t,
-                                81,
-                                &[h, sh, cs[0], cs[1], cs[2], clamped],
-                            )
-                        })
-                        .collect()
-                };
-                let lods = if let Some(sh) = single_sh {
-                    emit_lods(&mut self.s, self.cur, sh)
-                } else {
-                    let (sel, slots) = const_sampler.unwrap();
-                    let merge = self.s.m.new_block();
-                    let mut arms: Vec<(usize, Vec<V>)> = Vec::with_capacity(slots.len());
-                    for (k, &slot) in slots.iter().enumerate() {
-                        let arm = if k + 1 < slots.len() {
-                            let arm = self.s.m.new_block();
-                            let next = self.s.m.new_block();
-                            let kk = self.s.m.i32(k as u32);
-                            let eq = self.s.m.cmp(self.cur, pred::EQ, sel, kk);
-                            self.s.m.terminate(self.cur, Term::CondBr(eq, arm, next));
-                            self.cur = next;
-                            arm
-                        } else {
-                            self.cur
-                        };
-                        let sh = self.s.sampler_handle(arm, slot);
-                        let vs = emit_lods(&mut self.s, arm, sh);
-                        self.s.m.terminate(arm, Term::Br(merge));
-                        arms.push((arm, vs));
-                    }
-                    self.cur = merge;
-                    (0..lod_chs.len())
-                        .map(|j| {
-                            let phi = self.s.m.phi(merge, f32t);
-                            let inc = arms.iter().map(|(bb, vs)| (vs[j], *bb)).collect();
-                            self.s.m.set_phi(phi, inc);
-                            phi
-                        })
-                        .collect()
-                };
-                for (k, lod) in lods.into_iter().enumerate() {
+                for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                    let clamped = self.s.m.bool(ch == 0);
+                    let lod = self.s.op(
+                        c,
+                        "calculateLOD.f32",
+                        Attr::ReadOnly,
+                        f32t,
+                        81,
+                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                    );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
@@ -10003,15 +9876,15 @@ impl<'a> Lower<'a> {
                     os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
                 }
             }
+            let mut args = vec![h, sh];
+            args.extend(&cs);
             let clamp = if has_cl {
                 let x = addr_packed(self, coord_base, coords)?;
                 to_float(self, x)
             } else {
                 fu
             };
-            let mut tail_args = cs.clone();
-            let mut gathered: Option<[V; 4]> = None;
-            let op_spec: Option<(&str, u32)> = match op {
+            match op {
                 // Outside a pixel shader there are no screen derivatives:
                 // the validator refuses `sample` there ("features
                 // incompatible with the shader stage": 730 compute programs,
@@ -10022,9 +9895,16 @@ impl<'a> Lower<'a> {
                 // lanes there; compute them from the lanes if a resolve
                 // shows the wrong mip.
                 60 if !self.s.pixel => {
-                    tail_args.extend(&os);
-                    tail_args.push(self.s.m.f32(0));
-                    Some(("sampleLevel.f32", 62))
+                    args.extend(&os);
+                    args.push(self.s.m.f32(0));
+                    self.s.op(
+                        c,
+                        "sampleLevel.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        62,
+                        &args,
+                    )
                 }
                 60 => {
                     if offset_word {
@@ -10048,9 +9928,10 @@ impl<'a> Lower<'a> {
                             }
                         }
                     }
-                    tail_args.extend(&os);
-                    tail_args.push(clamp);
-                    Some(("sample.f32", 60))
+                    args.extend(&os);
+                    args.push(clamp);
+                    self.s
+                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
                     // With a16 the bias is an f16 in the low half of its
@@ -10063,14 +9944,28 @@ impl<'a> Lower<'a> {
                     } else {
                         self.as_float(bias)
                     };
-                    tail_args.extend(&os);
+                    args.extend(&os);
                     if self.s.pixel {
-                        tail_args.extend([bias, clamp]);
-                        Some(("sampleBias.f32", 61))
+                        args.extend([bias, clamp]);
+                        self.s.op(
+                            c,
+                            "sampleBias.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            61,
+                            &args,
+                        )
                     } else {
                         // As above: the bias is the level.
-                        tail_args.push(bias);
-                        Some(("sampleLevel.f32", 62))
+                        args.push(bias);
+                        self.s.op(
+                            c,
+                            "sampleLevel.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            62,
+                            &args,
+                        )
                     }
                 }
                 63 if kind == 5 => {
@@ -10107,9 +10002,16 @@ impl<'a> Lower<'a> {
                     let ln = self.unary(23, texels);
                     let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
                     let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
-                    tail_args.extend(&os);
-                    tail_args.push(lod);
-                    Some(("sampleLevel.f32", 62))
+                    args.extend(&os);
+                    args.push(lod);
+                    self.s.op(
+                        c,
+                        "sampleLevel.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        62,
+                        &args,
+                    )
                 }
                 63 => {
                     let mut g = vec![fu; 6];
@@ -10119,22 +10021,31 @@ impl<'a> Lower<'a> {
                         let y = addr_packed(self, first + deriv_regs, k)?;
                         g[3 + k] = to_float(self, y);
                     }
-                    tail_args.extend(&os);
-                    tail_args.extend(g);
-                    tail_args.push(clamp);
-                    Some(("sampleGrad.f32", 63))
+                    args.extend(&os);
+                    args.extend(g);
+                    args.push(clamp);
+                    self.s.op(
+                        c,
+                        "sampleGrad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        63,
+                        &args,
+                    )
                 }
                 64 | 65 => {
                     let reference = addr_u32(self, first - 1)?;
                     let reference = self.as_float(reference);
-                    tail_args.extend(&os);
-                    tail_args.push(reference);
-                    if op == 64 {
-                        tail_args.push(clamp);
-                        Some(("sampleCmp.f32", 64))
+                    args.extend(&os);
+                    args.push(reference);
+                    let name = if op == 64 {
+                        args.push(clamp);
+                        "sampleCmp.f32"
                     } else {
-                        Some(("sampleCmpLevelZero.f32", 65))
-                    }
+                        "sampleCmpLevelZero.f32"
+                    };
+                    self.s
+                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
@@ -10143,9 +10054,16 @@ impl<'a> Lower<'a> {
                     } else {
                         self.s.m.f32(0)
                     };
-                    tail_args.extend(&os);
-                    tail_args.push(lod);
-                    Some(("sampleLevel.f32", 62))
+                    args.extend(&os);
+                    args.push(lod);
+                    self.s.op(
+                        c,
+                        "sampleLevel.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        62,
+                        &args,
+                    )
                 }
                 _ => {
                     if name == "image_gather4" {
@@ -10208,6 +10126,7 @@ impl<'a> Lower<'a> {
                         }
                         let ch = dmask.trailing_zeros();
                         let mut g = [fu; 4];
+                        let mut read = None;
                         let texels = [(lo[0], hi[1]), (hi[0], hi[1]), (hi[0], lo[1]), (lo[0], lo[1])];
                         for (slot, (x, y)) in g.iter_mut().zip(texels) {
                             let r = self.s.op(
@@ -10219,61 +10138,22 @@ impl<'a> Lower<'a> {
                                 &[h, mip, x, y, iu, iu, iu, iu],
                             );
                             *slot = self.s.m.extract(c, r, ch);
+                            read = Some(r);
                         }
                         gathered = Some(g);
-                        None
+                        read.expect("four reads")
                     } else {
-                        tail_args.extend(&os[..2]);
-                        tail_args.push(self.s.m.i32(dmask.trailing_zeros()));
-                        Some(("textureGather.f32", 73))
+                        args.extend(&os[..2]);
+                        args.push(self.s.m.i32(dmask.trailing_zeros()));
+                        self.s.op(
+                            c,
+                            "textureGather.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            73,
+                            &args,
+                        )
                     }
-                }
-            };
-            if let Some(g) = gathered {
-                channels.iter().map(|&ch| g[ch as usize]).collect()
-            } else {
-                let (op_name, op_code) = op_spec.expect("sample op");
-                let emit_sample = |s: &mut Shader, blk: usize, sh: V| -> Vec<V> {
-                    let mut args = Vec::with_capacity(2 + tail_args.len());
-                    args.push(h);
-                    args.push(sh);
-                    args.extend(&tail_args);
-                    let r = s.op(blk, op_name, Attr::ReadOnly, s.t.res_ret, op_code, &args);
-                    channels.iter().map(|&ch| s.m.extract(blk, r, ch)).collect()
-                };
-                if let Some(sh) = single_sh {
-                    emit_sample(&mut self.s, self.cur, sh)
-                } else {
-                    let (sel, slots) = const_sampler.unwrap();
-                    let merge = self.s.m.new_block();
-                    let mut arms: Vec<(usize, Vec<V>)> = Vec::with_capacity(slots.len());
-                    for (k, &slot) in slots.iter().enumerate() {
-                        let arm = if k + 1 < slots.len() {
-                            let arm = self.s.m.new_block();
-                            let next = self.s.m.new_block();
-                            let kk = self.s.m.i32(k as u32);
-                            let eq = self.s.m.cmp(self.cur, pred::EQ, sel, kk);
-                            self.s.m.terminate(self.cur, Term::CondBr(eq, arm, next));
-                            self.cur = next;
-                            arm
-                        } else {
-                            self.cur
-                        };
-                        let sh = self.s.sampler_handle(arm, slot);
-                        let vs = emit_sample(&mut self.s, arm, sh);
-                        self.s.m.terminate(arm, Term::Br(merge));
-                        arms.push((arm, vs));
-                    }
-                    self.cur = merge;
-                    let f32t = self.s.t.f32;
-                    (0..channels.len())
-                        .map(|j| {
-                            let phi = self.s.m.phi(merge, f32t);
-                            let inc = arms.iter().map(|(bb, vs)| (vs[j], *bb)).collect();
-                            self.s.m.set_phi(phi, inc);
-                            phi
-                        })
-                        .collect()
                 }
             }
         } else {
@@ -10293,22 +10173,29 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
-            let r = self.s.op(
+            self.s.op(
                 c,
                 "textureLoad.f32",
                 Attr::ReadOnly,
                 self.s.t.res_ret,
                 66,
                 &args,
-            );
-            channels
-                .iter()
-                .map(|&ch| self.s.m.extract(c, r, ch))
-                .collect()
+            )
         };
-        let c = self.cur;
+        let Operand::Vector { reg, .. } = *data else {
+            return Err("an image result");
+        };
+        let channels: Vec<u32> = if op == 73 {
+            vec![0, 1, 2, 3]
+        } else {
+            (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
+        };
         let mut xs = Vec::new();
-        for x in ch_vals {
+        for ch in channels {
+            let x = match gathered {
+                Some(g) => g[ch as usize],
+                None => self.s.m.extract(c, r, ch),
+            };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
@@ -12111,92 +11998,5 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
-    }
-
-    #[test]
-    fn descriptor_chosen_by_control_flow_and_constant_sampler_phi_lower() {
-        // 1. Uniform Source::Phi over two table-loaded SRV buffer descriptors.
-        let buf_phi = [
-            0xBE84_0300, // 0:  s_mov_b32 s4, s0
-            0xBE85_0380, // 4:  s_mov_b32 s5, 0
-            0xBF06_8001, // 8:  s_cmp_eq_u32 s1, 0
-            0xBF85_0003, // 12: s_cbranch_scc1 -> 28
-            0xF408_0202,
-            0xFA00_0000, // 16: s_load_dwordx4 s[8:11], s[4:5], null
-            0xBF82_0002, // 24: s_branch -> 36
-            0xF408_0202,
-            0xFA00_0020, // 28: s_load_dwordx4 s[8:11], s[4:5], 0x20
-            0xF420_0304,
-            0xFA00_0000, // 36: s_buffer_load_dword s12, s[8:11], null
-            0x7E02_020C, // 44: v_mov_b32 v1, s12
-            0xD834_0000,
-            0x0000_0100, // 48: ds_write_b32 v0, v1
-            S_ENDPGM,
-        ];
-        lower_with(
-            &buf_phi,
-            vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)],
-            vec![
-                UsedResource {
-                    kind: ResourceType::Srv,
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    lower_bound: 0,
-                    stride: 0,
-                    dwords: 4,
-                    user_data: 0,
-                    slot: 0,
-                },
-                UsedResource {
-                    kind: ResourceType::Srv,
-                    root: RootType::Table,
-                    table_offset_dwords: 8,
-                    lower_bound: 0,
-                    stride: 0,
-                    dwords: 4,
-                    user_data: 0,
-                    slot: 0,
-                },
-            ],
-        )
-        .expect("Source::Phi of loaded buffer descriptors");
-
-        // 2. Uniform Source::Phi over two distinct immediate constant samplers.
-        let samp_phi = [
-            0xBE84_0300, // 0:  s_mov_b32 s4, s0
-            0xBE85_0380, // 4:  s_mov_b32 s5, 0
-            0xF40C_0202,
-            0xFA00_0000, // 8:  s_load_dwordx8 s[8:15], s[4:5], null
-            0xBE91_0380, // 16: s_mov_b32 s17, 0
-            0xBE92_0380, // 20: s_mov_b32 s18, 0
-            0xBE93_0380, // 24: s_mov_b32 s19, 0
-            0xBF06_8001, // 28: s_cmp_eq_u32 s1, 0
-            0xBF85_0002, // 32: s_cbranch_scc1 -> 44
-            0xBE90_0380, // 36: s_mov_b32 s16, 0 (point clamp sampler)
-            0xBF82_0002, // 40: s_branch -> 52
-            0xBE90_03FF,
-            0x0000_0001, // 44: s_mov_b32 s16, 1 (different immediate sampler)
-            0xF09C_0F08,
-            0x0082_0402, // 52: image_sample_lz v[4:7], v[2:3], s[8:15], s[16:19]
-            0xD834_0000,
-            0x0000_0400, // 60: ds_write_b32 v0, v4
-            S_ENDPGM,
-        ];
-        let out = lower_with(
-            &samp_phi,
-            vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)],
-            vec![UsedResource {
-                kind: ResourceType::Srv,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 8,
-                user_data: 0,
-                slot: 0,
-            }],
-        )
-        .expect("Source::Phi of immediate constant samplers");
-        assert_eq!(out.samplers.len(), 2);
     }
 }

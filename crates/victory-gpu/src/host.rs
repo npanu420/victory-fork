@@ -3145,6 +3145,29 @@ impl Host {
         })
     }
 
+    /// Whether the host GPU lets a view of a typed texture use another
+    /// format of the same family (D3D12's relaxed casting rules, reported
+    /// in Options3); logged once.
+    pub(crate) fn typed_format_casting(&self) -> bool {
+        static CASTING: OnceLock<bool> = OnceLock::new();
+        *CASTING.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: writes `options` of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok && options.CastingFullyTypedFormatSupported.as_bool();
+            tracing::info!(supported, "host typed format casting support");
+            supported
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]

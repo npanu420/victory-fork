@@ -1788,17 +1788,16 @@ fn rehash_runs() -> bool {
 /// hashed, and compare passes after the lists.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
-/// one fetch and were then merged one after the other on the thread that
-/// settles: about 630 pieces and 40 MB a frame (run 104), each compared
-/// with the copy's CPU side byte by byte and put into title memory through
-/// the kernel. A piece is its own bytes of its copy and of title memory,
-/// so eight threads take an eighth of them each.
+/// Whether merging fetched card pieces runs on several threads
+/// (`VICTORY_WIDE_MERGE=0` runs on one thread). The pieces the card's
+/// compare found differing come down in one fetch and were then merged one
+/// after the other on the thread that settles: about 630 pieces and 40 MB a
+/// frame (run 104), each compared with the copy's CPU side byte by byte and
+/// put into title memory through the kernel. A piece is its own bytes of
+/// its copy and of title memory, so up to eight threads share the work.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -2205,9 +2204,41 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
+/// Groups relay runs whose shadows overlap in title memory. The group runs
+/// in the original merge order, so each merge reads the prior writes.
+fn relay_merge_groups<T>(runs: Vec<T>, range: impl Fn(&T) -> (u64, u64)) -> Vec<Vec<T>> {
+    let mut ordered: Vec<_> = runs.iter().enumerate().map(|(i, run)| (range(run), i)).collect();
+    ordered.sort_unstable_by_key(|&((start, _), _)| start);
+    let mut membership = vec![0; runs.len()];
+    let mut groups = Vec::new();
+    let mut end = 0;
+    for ((start, stop), i) in ordered {
+        if groups.is_empty() || start >= end {
+            groups.push(Vec::new());
+        }
+        end = end.max(stop);
+        membership[i] = groups.len() - 1;
+    }
+    for (run, group) in runs.into_iter().zip(membership) {
+        groups[group].push(run);
+    }
+    groups
+}
+
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{flagged_pieces, landable, relay_merge_groups};
+
+    #[test]
+    fn overlapping_shadows_merge_in_the_same_group() {
+        let (outer, nested, overlap, chain, touching, separate) =
+            ((10, 50), (20, 30), (40, 60), (55, 80), (80, 90), (100, 110));
+        let runs = vec![overlap, separate, outer, nested, chain, touching, outer];
+        assert_eq!(
+            relay_merge_groups(runs, |run| *run),
+            [vec![overlap, outer, nested, chain, outer], vec![touching], vec![separate]]
+        );
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -3895,8 +3926,7 @@ impl Host {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
+        let mut raw_pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
@@ -3923,15 +3953,15 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                            raw_pieces.push((r.shadow.clone(), lo, hi));
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
             }
         }
-        if pieces.is_empty() {
+        let piece_count = raw_pieces.len() as u64;
+        if raw_pieces.is_empty() {
             if inflight_fetch() {
                 // The next merge may be of a flight in the air now, with
                 // bytes from when it ran: only sends up to these plans' are
@@ -3947,6 +3977,27 @@ impl Host {
         }
         if inflight_fetch() {
             INFLIGHT_STATS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        // Sort by (shadow, offset) and coalesce adjacent dirty pieces (up to
+        // 1 MiB per run) to cut CopyBufferRegion, ReadProcessMemory, guard
+        // open, and NtWriteVirtualMemory calls per frame.
+        raw_pieces.sort_unstable_by_key(|(s, lo, _)| (std::sync::Arc::as_ptr(s) as usize, *lo));
+        const MAX_RUN: usize = 1 << 20;
+        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> =
+            Vec::with_capacity(raw_pieces.len());
+        let mut total = 0u64;
+        for (shadow, lo, hi) in raw_pieces {
+            if let Some((last_s, last_lo, last_hi, _)) = pieces.last_mut()
+                && std::sync::Arc::ptr_eq(last_s, &shadow)
+                && *last_hi == lo
+                && hi - *last_lo <= MAX_RUN
+            {
+                *last_hi = hi;
+                total += (hi - lo) as u64;
+            } else {
+                pieces.push((shadow, lo, hi, total));
+                total += (hi - lo) as u64;
+            }
         }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
@@ -4009,21 +4060,67 @@ impl Host {
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
-            CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+            CARD_STATS[3].fetch_add(piece_count, Ordering::Relaxed);
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
-        }
+        let written = if wide_merge() && pieces.len() >= 4 {
+            let mut groups = relay_merge_groups(pieces, |(shadow, _, _, _)| shadow.title_range());
+            let buckets = groups.len().min(8);
+            let mut shards: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>> =
+                (0..buckets).map(|_| Vec::new()).collect();
+            let mut shard_bytes = vec![0usize; buckets];
+            groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.iter().map(|x| x.2 - x.1).sum::<usize>()));
+            for group in groups {
+                let bytes: usize = group.iter().map(|x| x.2 - x.1).sum();
+                let idx = shard_bytes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, &b)| b)
+                    .map_or(0, |(i, _)| i);
+                shard_bytes[idx] += bytes;
+                shards[idx].extend(group);
+            }
+            let written_total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = shards
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .map(|shard| {
+                    let written_total = written_total.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut local = 0usize;
+                        for (shadow, lo, hi, at) in shard {
+                            // SAFETY: the mapping of the fetched bytes, `total`
+                            // of them; the copy into it has run, and `wide_run`
+                            // waits for this job before returning.
+                            let gpu = unsafe {
+                                std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo)
+                            };
+                            let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
+                            shadow.walls_merged(gpu.len(), merged);
+                            local += merged;
+                        }
+                        written_total.fetch_add(local, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            written_total.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
+            written
+        };
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge; with the
         // fetch inside flights only those up to these plans' are

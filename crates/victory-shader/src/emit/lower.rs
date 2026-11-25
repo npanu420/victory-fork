@@ -4746,6 +4746,17 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // DXIL has no atomic subtraction (its atomic operations are add,
+        // and, or, xor, min, max, unsigned min and max, and exchange): the
+        // value to subtract is added negated, and the old value returns as
+        // for the other operations.
+        let (rmw, v0) = match rmw {
+            Some(Rmw::Sub) => {
+                let zero = self.s.m.i32(0);
+                (Some(Rmw::Add), self.s.m.bin(self.cur, Bin::Sub, zero, v0))
+            }
+            other => (other, v0),
+        };
         let at = self.begin_guarded(guard);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),

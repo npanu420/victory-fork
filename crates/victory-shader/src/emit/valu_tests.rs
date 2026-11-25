@@ -1299,6 +1299,102 @@ fn ds_min_max_f32_are_atomic_across_waves() {
     }
 }
 
+/// DS `op vdst, addr, data0, data1` at offset 0.
+const fn ds2(op: u8, vdst: u8, addr: u8, data0: u8, data1: u8) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18,
+        (vdst as u32) << 24 | (data1 as u32) << 16 | (data0 as u32) << 8 | addr as u32,
+    ]
+}
+
+/// The 32-bit LDS atomics against the instruction set document: for each,
+/// the new content of the dword and (the `_rtn` form) the old content it
+/// returns, from an initial value and two operands. One thread, one dword.
+#[test]
+fn lds_atomics_match_the_rdna2_definitions() {
+    // (name, opcode of the form without a result, reference of the new
+    // content from the old one and the two operands). The `_rtn` opcode is
+    // 0x20 above.
+    #[allow(clippy::type_complexity)]
+    let operations: &[(&str, u8, fn(u32, u32, u32) -> u32)] = &[
+        ("ds_add_u32", 0x00, |m, a, _| m.wrapping_add(a)),
+        ("ds_sub_u32", 0x01, |m, a, _| m.wrapping_sub(a)),
+        ("ds_min_i32", 0x05, |m, a, _| {
+            (m as i32).min(a as i32) as u32
+        }),
+        ("ds_max_i32", 0x06, |m, a, _| {
+            (m as i32).max(a as i32) as u32
+        }),
+        ("ds_min_u32", 0x07, |m, a, _| m.min(a)),
+        ("ds_max_u32", 0x08, |m, a, _| m.max(a)),
+        ("ds_and_b32", 0x09, |m, a, _| m & a),
+        ("ds_or_b32", 0x0a, |m, a, _| m | a),
+        ("ds_xor_b32", 0x0b, |m, a, _| m ^ a),
+        // Stores the second operand when the content equals the first.
+        ("ds_cmpst_b32", 0x10, |m, a, b| if m == a { b } else { m }),
+    ];
+    let values = [
+        0u32,
+        1,
+        2,
+        5,
+        0x7fff_ffff,
+        0x8000_0000,
+        0xffff_fffe,
+        0xffff_ffff,
+    ];
+    let mut cases = Vec::new();
+    for &m in &values {
+        for &a in &values {
+            for b in [0u32, 0xf0f0_f0f0] {
+                cases.push([m, a, b, 0]);
+            }
+        }
+    }
+    // One thread with LDS declares WaveSize(32), which WARP's pipeline
+    // creation refuses: hardware only, as the other single-thread LDS tests.
+    let hardware = &[("hardware", false)];
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        eprintln!("the hardware adapter is WARP; skipped");
+        return;
+    }
+    let mut failures = Vec::new();
+    for &(name, opcode, reference) in operations {
+        // v5 = 0 (the address); LDS[0] = v1; op (v2, v3); then either the
+        // result register or a read of the dword.
+        let prefix = |op: u32, result: u8| {
+            let mut body = vec![vop1(0x001, 5, 0x80)];
+            body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+            body.push(S_BARRIER);
+            body.extend(ds2(op as u8, result, 5, 2, 3));
+            body.push(S_BARRIER);
+            body
+        };
+        let mut new_content = prefix(u32::from(opcode), 0);
+        new_content.extend(ds(DS_READ_B32, 0, 5, 0));
+        let new_content = build_cs(&new_content, 1, 512);
+        let old_content = build_cs(&prefix(u32::from(opcode) + 0x20, 0), 1, 512);
+        run_cases_on(&new_content, &cases, hardware, |backend, _, inp, got| {
+            let want = reference(inp[0], inp[1], inp[2]);
+            if got != want && failures.len() < 40 {
+                failures.push(format!(
+                    "{backend}: {name}({:#x}; {:#x}, {:#x}) leaves {got:#x}, want {want:#x}",
+                    inp[0], inp[1], inp[2]
+                ));
+            }
+        });
+        run_cases_on(&old_content, &cases, hardware, |backend, _, inp, got| {
+            if got != inp[0] && failures.len() < 40 {
+                failures.push(format!(
+                    "{backend}: {name}_rtn({:#x}; {:#x}, {:#x}) returns {got:#x}, want the old {:#x}",
+                    inp[0], inp[1], inp[2], inp[0]
+                ));
+            }
+        });
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6

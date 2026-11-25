@@ -795,6 +795,11 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// With [`fill_on_card`]: a device-local buffer constant buffer views of
+    /// the list read, filled by copies on the card ([`HostList::card_constants`]):
+    /// the buffer, the bytes used, and whether it is in the constant buffer
+    /// state (it decays to the common state when a submission has run).
+    card_constants: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2372,6 +2377,21 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
+/// Whether title memory `[from, to)` lies in what flights in the air may
+/// write (with [`late`]).
+pub(crate) fn flights_write(from: usize, to: usize) -> bool {
+    touches(&line().written, from, to)
+}
+
+/// Whether a constant buffer view of a table whose title memory flights may
+/// write is filled on the card, behind them ([`HostList::card_constants`]),
+/// instead of in upload memory at submission, which waits for them to land
+/// (`VICTORY_FILL_ON_CARD=0` fills it as before).
+pub(crate) fn fill_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_ON_CARD").is_none_or(|v| v != "0"))
+}
+
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     if from >= to {
@@ -2443,6 +2463,16 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            static NAMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                            if NAMED.fetch_add(1, Ordering::Relaxed) < 12 {
+                                let copy = crate::shadow::find(src as u64, len as u64).map(|s| s.span());
+                                tracing::info!(
+                                    src = format_args!("{src:#x}"),
+                                    len,
+                                    copy = ?copy.map(|(a, l)| format!("{a:#x}+{l:#x}")),
+                                    "a fill of upload memory reads what a flight writes"
+                                );
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -3297,6 +3327,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                card_constants: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5203,6 +5234,11 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some(c) = self.card_constants.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            // Every submission of the list has run: the buffer is free, and
+            // in the common state again.
+            (c.1, c.2) = (0, false);
+        }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -5642,6 +5678,57 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+    }
+
+    /// With [`fill_on_card`]: `len` bytes of the host copy `shadow` from title
+    /// address `address`, copied on the card where the list stands into its
+    /// device-local constants buffer: the GPU address of the bytes there (on
+    /// 256 bytes, for a constant buffer view), or `None` (no buffer, no room).
+    ///
+    /// A fill of upload memory reads title memory on the CPU at submission,
+    /// and a submission whose fill reads what a flight's shaders write waits
+    /// for the flight to land (52-80 ms a frame in the world, one table
+    /// constant buffer of 512 bytes). Read on the card, behind the flight on
+    /// the same queue, those bytes are what the shaders wrote without the
+    /// wait; title writes to them reach the copy first, through its refresh.
+    pub(crate) fn card_constants(&self, shadow: &crate::shadow::Shadow, address: u64, len: u64) -> Option<u64> {
+        const SIZE: u64 = 1 << 20;
+        let host = host()?;
+        let offset = shadow.offset_in(address)?;
+        if len == 0 || shadow.left(address) < len {
+            return None;
+        }
+        let room = len.next_multiple_of(256);
+        let mut c = self.card_constants.lock().unwrap_or_else(|e| e.into_inner());
+        if c.is_none() {
+            let buffer = host.uav_buffer(SIZE)?;
+            name(&buffer, || "list constants on the card".into());
+            *c = Some((buffer, 0, false));
+        }
+        let (buffer, used, readable) = c.as_mut()?;
+        let buffer: &ID3D12Resource = buffer;
+        if *used + room > SIZE {
+            return None;
+        }
+        let at = *used;
+        *used += room;
+        let constants = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        // SAFETY: an open list; both buffers are live and the ranges inside
+        // them (checked above).
+        unsafe {
+            if *readable {
+                self.list.ResourceBarrier(&[transition(buffer, constants, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            }
+            // What shaders of this list wrote to the copy before, first.
+            self.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            }]);
+            self.list.CopyBufferRegion(buffer, at, &shadow.buffer, offset, len);
+            self.list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COPY_DEST, constants)]);
+            *readable = true;
+            Some(buffer.GetGPUVirtualAddress() + at)
+        }
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7506,5 +7593,98 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!should_record_brought(0, None));
         assert!(!should_record_brought(1, None));
         assert!(should_record_brought(2, None));
+    }
+}
+
+#[cfg(test)]
+mod fill_on_card_tests {
+    use super::*;
+
+    /// A readback buffer of `len` bytes.
+    fn readback(host: &Host, len: u64) -> ID3D12Resource {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+                .unwrap();
+        }
+        buffer.unwrap()
+    }
+
+    /// What a flight's shaders wrote to a host copy (bytes the title's memory
+    /// does not have) reaches constants filled on the card, byte for byte,
+    /// for two fills in one list.
+    #[test]
+    fn constants_filled_on_the_card_read_what_the_card_wrote() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        const LEN: usize = 1 << 16;
+        // Title memory: a buffer the title fills with 0xAA.
+        let title: &'static mut [u8] = Box::leak(vec![0xAAu8; LEN].into_boxed_slice());
+        let start = title.as_ptr() as u64;
+        let resource = 0x7e57_0001usize;
+        crate::shadow::register(resource, start, LEN as u64);
+        let shadow = crate::shadow::find(start + 64, 512).expect("a host copy");
+        let offset = shadow.offset_in(start).expect("the copy starts at the buffer");
+        // A "flight" writes a pattern into the copy on the card.
+        let pattern: Vec<u8> = (0..1024u32).map(|i| (i * 7 + 3) as u8).collect();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        // SAFETY: the upload buffer holds 1024 mapped bytes.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 1024) };
+        let flight = host.new_list().unwrap();
+        // SAFETY: an open list; live buffers, ranges inside them.
+        unsafe { flight.list.CopyBufferRegion(&shadow.buffer, offset + 64, &upload, 0, 1024) };
+        flight.close();
+        host.execute(&[&flight]);
+        // The next list fills two constant buffers from it on the card.
+        let list = host.new_list().unwrap();
+        let first = list.card_constants(&shadow, start + 64, 512).expect("room");
+        let second = list.card_constants(&shadow, start + 64 + 512, 300).expect("room");
+        assert_eq!(first % 256, 0);
+        assert_eq!(second % 256, 0);
+        let constants = list.card_constants.lock().unwrap().as_ref().unwrap().0.clone();
+        // SAFETY: a live buffer.
+        let base = unsafe { constants.GetGPUVirtualAddress() };
+        let back = readback(host, 1024);
+        // SAFETY: an open list; the constants buffer is in the constant
+        // buffer state after the fills; ranges inside both buffers.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &constants,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&back, 0, &constants, first - base, 512);
+            list.list.CopyBufferRegion(&back, 512, &constants, second - base, 300);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copies finished (execute waits); 1024 bytes.
+        let read = unsafe {
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024).to_vec()
+        };
+        assert_eq!(read[..512], pattern[..512], "the first fill");
+        assert_eq!(read[512..812], pattern[512..812], "the second fill");
+        // The title's memory was never read: it still holds 0xAA.
+        assert!(title[64..1088].iter().all(|&b| b == 0xAA));
+        crate::shadow::unregister(resource, start);
     }
 }

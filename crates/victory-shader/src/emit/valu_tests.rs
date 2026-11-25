@@ -1622,3 +1622,165 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+#[test]
+fn ps_sample_coverage_input_reads_coverage_mask() {
+    use super::bitcode::{Attr, Term};
+    use super::container::{self, SigElement};
+    use super::host::Draw;
+    use super::shader::Shader;
+    use crate::dxbc::{Container, FourCC};
+
+    // SPI_PS_INPUT_ADDR bit 14 puts the sample coverage mask in v0.
+    // Convert u32 -> f32 into v1 and export mrt0 = (v1, v1, v1, v1).
+    let words = [
+        vop1(0x006, 1, vgpr(0)), // v_cvt_f32_u32 v1, v0
+        0xF800_180F,
+        0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 2,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 1 << 14,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    // Include SV_Coverage (kind 14) in console ISG1 to verify emit() strips it
+    // (NotInSig in DXIL) while keeping SV_Target in OSG1.
+    let isg1 = container::signature(
+        &[SigElement {
+            name: "SV_Coverage".into(),
+            index: 0,
+            kind: 14,
+            comp: 5,
+            interp: 0,
+            row: None,
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        }],
+        true,
+    );
+    let osg1 = container::signature(
+        &[SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        }],
+        false,
+    );
+    let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+    let c = Container::parse(&bytes).expect("Container::parse");
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let ps = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = ps.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    // Minimal pass-through VS: POSITION -> SV_Position.
+    let mut s = Shader::new(false);
+    let b = s.entry;
+    let undef = s.m.undef(s.t.i32);
+    for col in 0..4u8 {
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), undef];
+        let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+        let out_args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), v];
+        s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &out_args);
+    }
+    s.inputs.push(SigElement {
+        name: "POSITION".into(),
+        index: 0,
+        kind: 0,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    });
+    s.outputs.push(SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    });
+    s.m.terminate(b, Term::Ret);
+    let vs = HostShader {
+        stage: HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
+    };
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .pipeline(&vs, &ps)
+            .unwrap_or_else(|e| panic!("{label}: graphics pipeline failed: {e}"));
+        let pixels = host
+            .draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: vec![
+                        (0, Root::Constants(vec![0])),
+                        (1, Root::Constants(vec![0])),
+                    ],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[
+                        -1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0,
+                    ],
+                    stride: 16,
+                    size: (2, 2),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: draw failed: {e}"));
+        // 1x sample target: every covered pixel reports coverage mask = 1 (bit 0).
+        assert_eq!(pixels, vec![[1.0; 4]; 4], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

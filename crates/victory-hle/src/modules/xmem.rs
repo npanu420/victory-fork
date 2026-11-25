@@ -702,7 +702,13 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map(
+            &mut physical,
+            base + i * PAGE,
+            run * PAGE,
+            first,
+            PageCommitment::Required,
+        ) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -767,16 +773,28 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        // The source view already committed this page of the same section.
+        if !map(&mut physical, to + k, PAGE, slice, PageCommitment::Existing) {
             return false;
         }
     }
     true
 }
 
+enum PageCommitment {
+    Required,
+    Existing,
+}
+
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
-fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+fn map(
+    physical: &mut Physical,
+    base: usize,
+    len: usize,
+    slice: Slice,
+    commitment: PageCommitment,
+) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -807,7 +825,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if matches!(commitment, PageCommitment::Required) && !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -823,8 +841,15 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     true
 }
 
+#[cfg(test)]
+thread_local! {
+    static COMMIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
+    #[cfg(test)]
+    COMMIT_CALLS.set(COMMIT_CALLS.get() + 1);
     if on_wine() {
         return true; // sections are committed whole there
     }
@@ -918,11 +943,23 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             )
         };
         if at < base {
-            map(physical, at, base - at, slice.clone());
+            map(
+                physical,
+                at,
+                base - at,
+                slice.clone(),
+                PageCommitment::Required,
+            );
         }
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            map(
+                physical,
+                end,
+                at + size - end,
+                Slice { index, ..slice },
+                PageCommitment::Required,
+            );
         }
     }
 }
@@ -1221,9 +1258,16 @@ mod tests {
         );
         assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
         // The GPU's page-mapping copy: what `a + 2 pages` shows, at `b`.
+        let commits_before_alias = COMMIT_CALLS.get();
         assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
-        // SAFETY: mapped read-write.
-        assert_eq!(unsafe { b.cast::<u8>().read() }, 7);
+        assert_eq!(COMMIT_CALLS.get(), commits_before_alias);
+        assert_eq!(query(b).host.State, MEM_COMMIT);
+        // SAFETY: both views are mapped read-write.
+        unsafe {
+            assert_eq!(b.cast::<u8>().read(), 7);
+            b.cast::<u8>().add(PAGE - 1).write(13);
+            assert_eq!(at(a, 2).cast::<u8>().add(PAGE - 1).read(), 13);
+        }
         assert!(map_alias(b as u64, 0, PAGE as u64));
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));

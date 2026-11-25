@@ -6652,6 +6652,16 @@ impl Meter {
                 slow[1] as f64 / 1e3 / frames,
                 slow[2] as f64 / 1e3
             );
+            {
+                let [fast, slow, walked, asked, absent_asked, unparked] = crate::watch::view_stats().map(|n| n as f64 / frames);
+                let (parked, ordinary) = crate::watch::parked_blocks();
+                tracing::info!(
+                    "view memory askings per frame (VICTORY_VIEW_SET): {fast:.0} answered in one lookup, {slow:.0} walked \
+                     {walked:.0} blocks that were not clean; {parked} blocks parked as uncommitted ({ordinary} of them \
+                     no placeholder, looked at again), {absent_asked:.0} questions to Windows whether they still are, \
+                     {unparked:.1} found committed; {asked:.1} questions to Windows whether a range is a view"
+                );
+            }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(

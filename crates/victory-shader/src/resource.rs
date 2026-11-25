@@ -71,8 +71,12 @@ pub enum Source {
     /// Fixed in the code (an immediate sampler, say).
     Constant(Vec<u32>),
     /// Chosen by control flow: one source per predecessor of `block`, in
-    /// [`crate::ir::Block::preds`] order.
-    Phi { block: usize, args: Vec<Source> },
+    /// [`crate::ir::Block::preds`] order, `None` on an edge no lane that
+    /// accesses the descriptor takes.
+    Phi {
+        block: usize,
+        args: Vec<Option<Source>>,
+    },
     /// Chosen by SCC (`scc`, the value an `s_cselect` or `s_cmov` of each
     /// dword reads): the source when it is set, then when it is clear.
     Select { scc: Value, args: Vec<Source> },
@@ -100,10 +104,10 @@ impl Source {
     /// The sources this one picks from (itself unless a phi).
     pub fn leaves(&self) -> Vec<&Source> {
         match self {
-            Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } => {
+            Source::Select { args, .. } | Source::Lanes { args, .. } => {
                 args.iter().flat_map(Source::leaves).collect()
             }
-            Source::LanePhi { args, .. } => {
+            Source::Phi { args, .. } | Source::LanePhi { args, .. } => {
                 args.iter().flatten().flat_map(Source::leaves).collect()
             }
             s => vec![s],
@@ -1244,31 +1248,6 @@ impl<'a> Tracer<'a> {
         only
     }
 
-    /// Whether lowering can make a handle for `source` in any block: its
-    /// heap index comes from root parameters and constants alone (a table
-    /// offset the code computes exists only where the load is).
-    fn anywhere(&self, source: &Source) -> bool {
-        match source {
-            Source::Constant(_) => true,
-            Source::Built { address, .. } => address.dynamic.is_none(),
-            Source::Loaded { load, .. } => {
-                let inst = self.inst(*load);
-                match &inst.fields {
-                    Fields::Smem {
-                        base,
-                        offset,
-                        soffset,
-                        ..
-                    } => self
-                        .smem_address(inst, base, *offset, soffset)
-                        .is_ok_and(|a| a.dynamic.is_none()),
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
-    }
-
     /// `t` as the lanes that reach the access being traced hold it: through
     /// joins they can have entered by one edge only ([`Self::only_edge`]).
     fn live(&self, mut t: Term) -> Term {
@@ -1315,6 +1294,7 @@ impl<'a> Tracer<'a> {
             return Err("a descriptor joined too often");
         }
         joins.push(block);
+        let preds = &self.p.blocks[block].preds;
         let phis = &self.p.blocks[block].phis;
         let edge = |j: usize| -> Vec<Term> {
             words
@@ -1325,23 +1305,79 @@ impl<'a> Tracer<'a> {
                 })
                 .collect()
         };
-        let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| self.classify(&edge(j), joins, known))
-            .collect::<Result<_, _>>();
-        let source = match args {
+        let all = (0..preds.len())
+            .map(|j| self.classify(&edge(j), joins, known).map(Some))
+            .collect::<Result<Vec<_>, _>>();
+        let source = match all {
             Ok(args) => Ok(Source::Phi { block, args }),
-            // An edge holds no descriptor. With only one edge the lanes
-            // that read the descriptor can have come by, it is what the
-            // registers hold on that one (a wave that took another edge
-            // has no lane left that reads it), if that can be named where
-            // it is read.
-            Err(e) => match self.only_edge(block, known) {
-                Some(j) => match self.classify(&edge(j), joins, known) {
-                    Ok(source) if self.anywhere(&source) => Ok(source),
-                    _ => Err(e),
-                },
-                None => Err(e),
-            },
+            // An edge holds no descriptor. Keep only edges the lanes that
+            // reach the access can have taken; provably dead edges become
+            // `None`.
+            Err(e) => {
+                let acyclic = preds.iter().all(|&q| self.rpo[q] < self.rpo[block]);
+                if let Some(lanes) = self.lanes
+                    && acyclic
+                {
+                    let mut parsed: Vec<Option<Source>> = Vec::with_capacity(preds.len());
+                    let mut live_count = 0usize;
+                    let mut failed = None;
+                    for (j, &q) in preds.iter().enumerate() {
+                        let n = known.len();
+                        known.push((lanes.reach[q], true));
+                        if let LaneExit::Branch {
+                            when,
+                            taken,
+                            not_taken,
+                        } = lanes.exits[q]
+                            && taken != not_taken
+                        {
+                            known.push((when, taken == block));
+                        }
+                        let edge_ok = self.meet(lanes, known);
+                        let res = if edge_ok {
+                            self.classify(&edge(j), joins, known).map(Some)
+                        } else {
+                            Ok(None)
+                        };
+                        known.truncate(n);
+                        match res {
+                            Ok(Some(s)) => {
+                                live_count += 1;
+                                parsed.push(Some(s));
+                            }
+                            Ok(None) => parsed.push(None),
+                            Err(err) => {
+                                failed = Some(err);
+                                break;
+                            }
+                        }
+                    }
+                    if failed.is_none() && live_count > 0 {
+                        if live_count == 1
+                            && let Some(only) = parsed.iter().flatten().next()
+                            && matches!(
+                                only,
+                                Source::Constant(_)
+                                    | Source::Built {
+                                        address: Address { dynamic: None, .. },
+                                        ..
+                                    }
+                            )
+                        {
+                            Ok(parsed.into_iter().flatten().next().unwrap())
+                        } else {
+                            Ok(Source::Phi {
+                                block,
+                                args: parsed,
+                            })
+                        }
+                    } else {
+                        Err(failed.unwrap_or(e))
+                    }
+                } else {
+                    Err(e)
+                }
+            }
         };
         joins.pop();
         source.map(Some)
@@ -2579,7 +2615,7 @@ pub(crate) mod tests {
         let offsets: Vec<_> = args
             .iter()
             .map(|a| match a {
-                Source::Loaded { load, .. } => {
+                Some(Source::Loaded { load, .. }) => {
                     r.scalar.iter().find(|s| s.0 == *load).unwrap().1.offset
                 }
                 a => panic!("{a:?}"),
@@ -3844,5 +3880,40 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn dead_incoming_phi_edge_is_skipped_for_scalar_descriptor() {
+        // B0 sets an unrelated non-descriptor value in s[4:7], branches to B2
+        // with s_cbranch_execz (provably false because EXEC is TRUE), and
+        // falls through to B1 which loads a table descriptor into s[4:7].
+        let r = track_words(
+            &[
+                0xBE84_0301, // 0:  s_mov_b32 s4, s1 (not a descriptor)
+                0xBE85_0301, // 4:  s_mov_b32 s5, s1
+                0xBE86_0301, // 8:  s_mov_b32 s6, s1
+                0xBE87_0301, // 12: s_mov_b32 s7, s1
+                0xBE82_0309, // 16: s_mov_b32 s2, s9
+                0xBE83_0380, // 20: s_mov_b32 s3, 0
+                0xBF88_0002, // 24: s_cbranch_execz -> 0x24 (dead: EXEC is TRUE)
+                0xF408_0101,
+                0xFA00_0000, // 28: s_load_dwordx4 s[4:7], s[2:3], null
+                0xF420_0202,
+                0xFA00_0000, // 36: s_buffer_load_dword s8, s[4:7], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        let Source::Phi { args, .. } = &r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors)
+        };
+        assert_eq!(args.len(), 2);
+        assert!(args.iter().any(|a| a.is_none()), "{args:?}");
+        assert!(
+            args.iter()
+                .any(|a| matches!(a, Some(Source::Loaded { .. }))),
+            "{args:?}"
+        );
     }
 }

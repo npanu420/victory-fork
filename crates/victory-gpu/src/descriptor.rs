@@ -164,6 +164,12 @@ fn mirror(handle: u64) {
 /// its 1,024 to 2,048 records is skipped: that walk, not the read, was most
 /// of the cost (300,000 to 485,000 records looked at a frame, of which
 /// 12,000 to 20,000 were new).
+///
+/// Keyed by the page's address alone, so a heap's pages go with it
+/// ([`Heap`]'s `Drop`): a heap placed where a released one was, holding the
+/// same bytes, would otherwise skip the sync its own host heap (new, and
+/// empty) needs. 64 KiB a page, 4,096 of them at most (256 MB): a world
+/// frame's 300,000 to 485,000 records are 150 to 475 of those pages.
 #[cfg(windows)]
 fn seen_pages() -> &'static std::sync::Mutex<std::collections::HashMap<usize, Vec<u8>>> {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Vec<u8>>>> =
@@ -333,6 +339,17 @@ impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        // The pages this heap's address range held are no longer the ones a
+        // heap placed there next holds: with its bytes kept, a heap that
+        // looks the same would skip a sync its host heap (new, and empty)
+        // needs. Taken before the range is removed, while it is still known.
+        if let Some(&(start, end, _)) = heaps.iter().find(|&&(_, _, h)| h == at) {
+            let (start, end) = (start as usize, end as usize);
+            seen_pages()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|&page, _| page < start || page >= end);
+        }
         heaps.retain(|&(_, _, h)| h != at);
     }
 }

@@ -618,6 +618,10 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root UAV over the buffer of the n-th writable view of the heap,
+    /// counted in heap order ([`Host::dispatch`] only): its contents come
+    /// back with that view's.
+    Written(usize),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -855,7 +859,9 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Written(_) => {
+                        return Err("root views in a draw".into());
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1389,6 +1395,10 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::Written(n) => {
+                        let (b, ..) = uavs.get(*n).ok_or("no such writable view")?;
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
                     }
                 }
             }

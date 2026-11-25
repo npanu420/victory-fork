@@ -43,14 +43,22 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
-///   host reads afterwards to make those copies for the frames to come.
+///   host reads afterwards to make those copies for the frames to come,
+///   and after them the marks of the copies stores went to
+///   ([`MEMORY_MARKS`]).
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
-/// Dwords of the [`SLOT_FAULTS`] buffer.
+/// Dwords of the fault notes at the start of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// After the fault notes in the [`SLOT_FAULTS`] buffer: one dword per
+/// numbered copy (dword [`MEMORY_FAULTS`] + n for copy `n`), set to 1 by
+/// every store and atomic a running lane makes through that copy. The host
+/// reads and clears them to learn which copies shaders write, so that it
+/// need not take every copy for written.
+pub const MEMORY_MARKS: u32 = 1024;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

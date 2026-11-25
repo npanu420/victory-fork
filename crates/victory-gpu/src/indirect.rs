@@ -281,6 +281,7 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    unkeep(list, &dst);
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
 }
 
@@ -301,6 +302,7 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    unkeep(list, &dst);
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
@@ -423,7 +425,41 @@ fn record_clamp_as(
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
+    if keep_args() {
+        list.set_indirect_kept(scratch);
+        return;
+    }
     done_on(&list.list, scratch);
+}
+
+/// Whether the scratch buffer stays in `INDIRECT_ARGUMENT` between the
+/// executions that read it (`VICTORY_INDIRECT_KEEP=1`; off by default):
+/// each execution ended with a transition of it back to `COMMON`, a
+/// barrier between every two indirect draws, even those reading a window
+/// clamped once for many of them ([`bound_ahead`]). Here it goes back only
+/// when a clamp is about to write it again; a buffer decays to `COMMON`
+/// when its submission ends, so a list starts with it there as before.
+pub(crate) fn keep_args() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_KEEP.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_KEEP").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`keep_args`], for its thread only.
+    static TEST_KEEP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Before a clamp writes `scratch`: back to `COMMON` if the list left it in
+/// `INDIRECT_ARGUMENT` ([`keep_args`]).
+fn unkeep(list: &HostList, scratch: &ID3D12Resource) {
+    if keep_args() && list.take_indirect_kept(scratch) {
+        done_on(&list.list, scratch);
+    }
 }
 
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
@@ -1498,6 +1534,49 @@ void main() {
                 "non-diagnostic shader must leave diagnostic budget words untouched"
             );
         }
+    }
+
+    /// `VICTORY_INDIRECT_KEEP`: the scratch stays in `INDIRECT_ARGUMENT`
+    /// after an execution, goes back to `COMMON` before the next clamp
+    /// writes it, and a reset forgets it (the buffer has decayed by then).
+    #[test]
+    fn kept_scratch_goes_back_before_a_clamp_and_at_reset() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let Some((src_buf, src_ptr)) = host.shared_buffer(64 << 10) else {
+            return;
+        };
+        // SAFETY: a mapped host buffer.
+        unsafe { std::ptr::write_bytes(src_ptr, 0x11, 64 << 10) };
+        super::TEST_KEEP.set(Some(true));
+        let b1 = bound(&list, (&src_buf, 0), None, (0, 16, 8)).unwrap();
+        done(&list, &b1);
+        assert!(list.indirect_kept(&b1), "after an execution the scratch stays readable as arguments");
+        // The next clamp writes the same scratch: it goes back first.
+        let b2 = bound(&list, (&src_buf, 128), None, (0, 16, 8)).unwrap();
+        assert_eq!(b1.as_raw(), b2.as_raw());
+        assert!(!list.indirect_kept(&b2), "a clamp takes the scratch back to COMMON before writing it");
+        done(&list, &b2);
+        assert!(list.indirect_kept(&b2));
+        // Ends the list in INDIRECT_ARGUMENT: legal, it decays when the
+        // submission is done.
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(!list.indirect_kept(&b2), "a reset list starts with the scratch in COMMON");
+        // And without the switch nothing is kept.
+        super::TEST_KEEP.set(Some(false));
+        let b3 = bound(&list, (&src_buf, 0), None, (0, 16, 8)).unwrap();
+        done(&list, &b3);
+        assert!(!list.indirect_kept(&b3));
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        super::TEST_KEEP.set(None);
     }
 }
 

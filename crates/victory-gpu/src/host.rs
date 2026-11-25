@@ -1881,6 +1881,11 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// With `VICTORY_INDIRECT_KEEP=1`: scratch buffers of clamped indirect
+    /// arguments left in `INDIRECT_ARGUMENT` after their executions (by
+    /// address), brought back to `COMMON` only when a clamp writes them
+    /// again (`crate::indirect`).
+    indirect_kept: std::collections::HashSet<usize>,
 }
 
 impl Deferred {
@@ -5798,6 +5803,25 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// Whether the scratch buffer `buffer` was left in `INDIRECT_ARGUMENT`
+    /// by this list (and is no longer, as the caller is about to record the
+    /// transition back): see `crate::indirect::keep_args`.
+    pub(crate) fn take_indirect_kept(&self, buffer: &ID3D12Resource) -> bool {
+        self.deferred().indirect_kept.remove(&(buffer.as_raw() as usize))
+    }
+
+    /// Whether this list left `buffer` in `INDIRECT_ARGUMENT` (tests).
+    #[cfg(test)]
+    pub(crate) fn indirect_kept(&self, buffer: &ID3D12Resource) -> bool {
+        self.deferred().indirect_kept.contains(&(buffer.as_raw() as usize))
+    }
+
+    /// The scratch buffer `buffer` stays in `INDIRECT_ARGUMENT` after an
+    /// execution read it.
+    pub(crate) fn set_indirect_kept(&self, buffer: &ID3D12Resource) {
+        self.deferred().indirect_kept.insert(buffer.as_raw() as usize);
     }
 
     /// Keeps `object` alive until the list is reset.

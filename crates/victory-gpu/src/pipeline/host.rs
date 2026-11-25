@@ -33,6 +33,12 @@ pub(crate) struct GraphicsState {
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
     depth_format: DXGI_FORMAT,
     samples: DXGI_SAMPLE_DESC,
+    views: Vec<D3D12_VIEW_INSTANCE_LOCATION>,
+}
+
+struct GraphicsStreamState<'a> {
+    depth: D3D12_DEPTH_STENCIL_DESC1,
+    views: &'a [D3D12_VIEW_INSTANCE_LOCATION],
 }
 
 impl Default for GraphicsState {
@@ -87,6 +93,7 @@ impl Default for GraphicsState {
                 Count: 1,
                 Quality: 0,
             },
+            views: Vec::new(),
         }
     }
 }
@@ -217,6 +224,32 @@ impl GraphicsState {
         }
     }
 
+    /// Copies static view locations from the stream's x64 descriptor.
+    /// Masked view instancing needs command-list support.
+    ///
+    /// # Safety
+    /// `at` points at a complete view-instancing subobject, including live
+    /// storage for the referenced locations when the descriptor is valid.
+    pub(crate) unsafe fn read_view_instancing(&mut self, at: *const u8) {
+        // SAFETY: the pointer-aligned payload follows the tag at +8.
+        let desc = unsafe {
+            at.add(8)
+                .cast::<D3D12_VIEW_INSTANCING_DESC>()
+                .read_unaligned()
+        };
+        if desc.Flags != D3D12_VIEW_INSTANCING_FLAG_NONE
+            || !(1..=D3D12_MAX_VIEW_INSTANCE_COUNT).contains(&desc.ViewInstanceCount)
+            || desc.pViewInstanceLocations.is_null()
+        {
+            return;
+        }
+        // SAFETY: the caller supplies this many live locations. Copy each
+        // pair without relying on the source's alignment.
+        self.views = (0..desc.ViewInstanceCount as usize)
+            .map(|i| unsafe { desc.pViewInstanceLocations.add(i).read_unaligned() })
+            .collect();
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     /// The blend as the host pipeline is made with it ([`Self::host_blend`]):
@@ -225,6 +258,10 @@ impl GraphicsState {
     /// its name, and the library would refuse it at every run (its
     /// description no longer matches) without storing the new one.
     pub(crate) fn describe(&self) -> String {
+        self.describe_with_views(&self.views)
+    }
+
+    fn describe_with_views(&self, views: &[D3D12_VIEW_INSTANCE_LOCATION]) -> String {
         let inputs: Vec<String> = self
             .inputs
             .iter()
@@ -241,7 +278,7 @@ impl GraphicsState {
         } else {
             ""
         };
-        format!(
+        let mut state = format!(
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
             self.host_blend(),
             self.sample_mask,
@@ -252,7 +289,33 @@ impl GraphicsState {
             self.targets,
             self.depth_format.0,
             self.samples
-        )
+        );
+        if !views.is_empty() {
+            use std::fmt::Write;
+            write!(state, " views {views:?}").expect("writing to a String cannot fail");
+        }
+        state
+    }
+
+    fn graphics_stream_state(
+        &self,
+        depth_bounds: bool,
+        query_view_tier: impl FnOnce() -> Option<D3D12_VIEW_INSTANCING_TIER>,
+    ) -> Option<GraphicsStreamState<'_>> {
+        // D3D12 permits a single explicit view on adapters without multiview.
+        let views = if self.views.len() <= 1
+            || query_view_tier().is_some_and(|tier| tier.0 >= D3D12_VIEW_INSTANCING_TIER_1.0)
+        {
+            self.views.as_slice()
+        } else {
+            &[]
+        };
+        if !depth_bounds && views.is_empty() {
+            return None;
+        }
+        let mut depth = self.depth1();
+        depth.DepthBoundsTestEnable = depth_bounds.into();
+        Some(GraphicsStreamState { depth, views })
     }
 
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
@@ -622,7 +685,6 @@ impl HostPipeline {
         } else {
             false
         };
-        let state = g.describe();
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
@@ -632,7 +694,7 @@ impl HostPipeline {
                 "mesh triangles",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
+                &g.describe(),
             );
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
@@ -703,6 +765,20 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
+        let stream = g.graphics_stream_state(depth_bounds, || {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: Options3 expects a writable structure of this size.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .ok()
+            .map(|()| options.ViewInstancingTier)
+        });
+        let state = g.describe_with_views(stream.as_ref().map_or(&[], |stream| stream.views));
         // A pipeline with the geometry stage has a name of its own in the
         // library; the others keep theirs.
         let name = |gs: Option<&Vec<u8>>| match gs {
@@ -720,8 +796,15 @@ impl HostPipeline {
             ),
         };
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
-            if depth_bounds {
-                return graphics_depth_bounds_pipeline(&host.device, &root, desc, g.depth1(), name);
+            if let Some(stream) = &stream {
+                return graphics_stream_pipeline(
+                    &host.device,
+                    &root,
+                    desc,
+                    stream.depth,
+                    stream.views,
+                    name,
+                );
             }
             super::library::pipeline(
                 name,
@@ -826,14 +909,13 @@ fn stream_pipeline<S>(
     )
 }
 
-/// A graphics pipeline enabling the depth bounds test: `D3D12_GRAPHICS_PIPELINE_STATE_DESC`
-/// has no field for `DepthBoundsTestEnable`, so it is created and loaded as a
-/// pipeline-state stream with `DEPTH_STENCIL1`.
-fn graphics_depth_bounds_pipeline(
+/// Creates or loads a graphics PSO with depth bounds, static views, or both.
+fn graphics_stream_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
     d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC1,
+    views: &[D3D12_VIEW_INSTANCE_LOCATION],
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
@@ -858,6 +940,35 @@ fn graphics_depth_bounds_pipeline(
         base: Stream,
         gs: Sub<D3D12_SHADER_BYTECODE>,
     }
+    #[repr(C)]
+    struct StreamViews<S> {
+        base: S,
+        views: Sub<D3D12_VIEW_INSTANCING_DESC>,
+    }
+
+    fn finish<S>(
+        device: &ID3D12Device,
+        mut base: S,
+        views: &[D3D12_VIEW_INSTANCE_LOCATION],
+        name: &str,
+    ) -> windows::core::Result<ID3D12PipelineState> {
+        if views.is_empty() {
+            return stream_pipeline(device, &mut base, name);
+        }
+        let mut stream = StreamViews {
+            base,
+            views: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING,
+                D3D12_VIEW_INSTANCING_DESC {
+                    ViewInstanceCount: views.len() as u32,
+                    pViewInstanceLocations: views.as_ptr(),
+                    Flags: D3D12_VIEW_INSTANCING_FLAG_NONE,
+                },
+            ),
+        };
+        stream_pipeline(device, &mut stream, name)
+    }
+
     let targets = D3D12_RT_FORMAT_ARRAY {
         RTFormats: d.RTVFormats,
         NumRenderTargets: d.NumRenderTargets,
@@ -878,14 +989,13 @@ fn graphics_depth_bounds_pipeline(
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, d.SampleDesc),
     };
     if d.GS.pShaderBytecode.is_null() {
-        let mut stream = base;
-        stream_pipeline(device, &mut stream, name)
+        finish(device, base, views, name)
     } else {
-        let mut stream = StreamGs {
+        let stream = StreamGs {
             base,
             gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, d.GS),
         };
-        stream_pipeline(device, &mut stream, name)
+        finish(device, stream, views, name)
     }
 }
 
@@ -1023,6 +1133,10 @@ fn root_signature(
 }
 
 #[cfg(test)]
+#[path = "view_instancing_test.rs"]
+mod view_instancing_test;
+
+#[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
@@ -1042,7 +1156,7 @@ mod tests {
     const PS: &str = "float4 main() : SV_Target { return 1; }";
 
     /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
-    fn dxc() -> Option<PathBuf> {
+    pub(super) fn dxc() -> Option<PathBuf> {
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => PathBuf::from(p),
             None => victory_shader::emit::validator::Validator::default_path()?
@@ -1051,7 +1165,7 @@ mod tests {
         dxc.exists().then_some(dxc)
     }
 
-    fn compile(dxc: &Path, dir: &Path, src: &str, profile: &str) -> Vec<u8> {
+    pub(super) fn compile(dxc: &Path, dir: &Path, src: &str, profile: &str) -> Vec<u8> {
         let (hlsl, out) = (
             dir.join(format!("{profile}.hlsl")),
             dir.join(format!("{profile}.dxil")),
@@ -1181,10 +1295,10 @@ mod tests {
             &[&vs, &ps],
             &g.describe(),
         );
-        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        let pso = graphics_stream_pipeline(&host.device, &root, &desc, g.depth1(), &[], &name)
             .expect("depth-bounds PSO made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        graphics_stream_pipeline(&host.device, &root, &desc, g.depth1(), &[], &name)
             .expect("depth-bounds PSO made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,

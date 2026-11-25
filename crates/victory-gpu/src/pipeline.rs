@@ -592,6 +592,8 @@ pub(crate) struct StreamDesc {
     stream: *const u8,
 }
 
+const VIEW_INSTANCING: u32 = 22;
+
 /// A subobject type's size (type included), and the stage it is if it is a
 /// shader. The console numbers amplification and mesh shaders 23 and 24
 /// (PC: 24 and 25); its own types from 25 on are not sized yet.
@@ -614,7 +616,7 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
         11 => Some((56, None)),
         17 => Some((16, None)),
         21 => Some((64, None)),
-        22 => Some((32, None)),
+        VIEW_INSTANCING => Some((32, None)),
         9 | 13 | 14 | 16 | 18 | 20 => Some((8, None)),
         _ => None,
     }
@@ -638,6 +640,8 @@ pub(crate) extern "system" fn create_stream(
     let mut shaders = Vec::new();
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
+    #[cfg(windows)]
+    let mut view_instancing = None;
     let mut at = 0;
     while at + 8 <= desc.size {
         // SAFETY: inside the stream the title passes.
@@ -656,11 +660,26 @@ pub(crate) extern "system" fn create_stream(
             shaders.extend(copy(stage, code));
         }
         #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
-        unsafe {
-            graphics.read(kind, desc.stream.add(at))
-        };
+        if kind == VIEW_INSTANCING {
+            if size > desc.size - at {
+                break;
+            }
+            view_instancing = Some(at);
+        } else {
+            // SAFETY: a whole subobject of this kind lies at `at`.
+            unsafe { graphics.read(kind, desc.stream.add(at)) };
+        }
         at += size;
+    }
+    // The stream can declare its view locations before its shaders.
+    #[cfg(windows)]
+    if let Some(at) = view_instancing
+        && shaders.iter().any(|s| s.stage == "vertex")
+        && shaders.iter().all(|s| matches!(s.stage, "vertex" | "pixel"))
+    {
+        // SAFETY: the full descriptor is in the stream. The caller keeps
+        // its referenced locations alive through this call.
+        unsafe { graphics.read_view_instancing(desc.stream.add(at)) };
     }
     hand_out(
         shaders,

@@ -23,7 +23,7 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
 
@@ -49,20 +49,45 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+#if VICTORY_GROUP_BUDGET
+groupshared uint costs[64];
+groupshared uint remaining;
+#if VICTORY_DIAGNOSTICS
+groupshared uint2 notes[64];
+#endif
+#endif
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
+#if VICTORY_GROUP_BUDGET
+void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+#else
 void main(uint3 id : SV_DispatchThreadID) {
+#endif
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
+#if VICTORY_GROUP_BUDGET
+    bool active = id.x < eff_count;
+#else
     if (id.x >= eff_count) return;
+#endif
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
+#if VICTORY_GROUP_BUDGET
+    uint cost = 0;
+#if VICTORY_DIAGNOSTICS
+    uint2 note = uint2(0, 0);
+#endif
+#else
     uint cost;
+#endif
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
+#if VICTORY_GROUP_BUDGET
+    if (active) {
+#endif
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 asked = src_args.Load2(src_at);
@@ -82,11 +107,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         // to 65,535 below, so the groups past it never run). Not the
         // garbage of a slot nothing wrote.
         if (asked.x <= (1u << 24) && asked.y <= 64u && asked.z <= 64u) {
+#if VICTORY_GROUP_BUDGET
+            note = uint2(asked.x, asked.x > 65535u ? 1u : 0u);
+#else
             uint noted;
             budget.InterlockedMax(12, asked.x, noted);
             if (asked.x > 65535u) {
                 budget.InterlockedAdd(16, 1u, noted);
             }
+#endif
         }
 #endif
         uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
@@ -108,14 +137,69 @@ void main(uint3 id : SV_DispatchThreadID) {
 #if VICTORY_DIAGNOSTICS
         // Diagnostics, in the budget buffer's next words: the largest
         // group count a mesh record asked for, and the groups asked in all.
+#if VICTORY_GROUP_BUDGET
+        note = uint2(g.x, min(g.x, 1u << 24));
+#else
         uint was;
         budget.InterlockedMax(4, g.x, was);
         budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+#endif
 #endif
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
+#if VICTORY_GROUP_BUDGET
+    }
+    costs[gi] = cost;
+#if VICTORY_DIAGNOSTICS
+    notes[gi] = note;
+#endif
+    // Every lane participates, including the inactive tail and both waves
+    // on wave32 hardware. Only active records are read or charged.
+    GroupMemoryBarrierWithGroupSync();
+    uint first = id.x - gi;
+    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
+    if (gi == 0 && n > 0) {
+        uint total = 0;
+#if VICTORY_DIAGNOSTICS
+        uint2 combined = uint2(0, 0);
+#endif
+        for (uint i = 0; i < n; i++) {
+            // Replace each cost with its exclusive prefix in lane order.
+            // Each cost is at most 2^26, so even the sum before min fits.
+            uint next = min(BUDGET, total + costs[i]);
+            costs[i] = total;
+            total = next;
+#if VICTORY_DIAGNOSTICS
+            combined = uint2(max(combined.x, notes[i].x), combined.y + notes[i].y);
+#endif
+        }
+        uint before = 0;
+        if (total > 0) {
+            budget.InterlockedOr(0, 0, before);
+            [allow_uav_condition]
+            while (before < BUDGET) {
+                uint prev;
+                budget.InterlockedCompareExchange(0, before, min(BUDGET, before + total), prev);
+                if (prev == before) break;
+                before = prev;
+            }
+        }
+        remaining = BUDGET - min(BUDGET, before);
+#if VICTORY_DIAGNOSTICS
+        if (kind >= 2) {
+            uint was;
+            uint offset = kind == 2 ? 12u : 4u;
+            if (combined.x > 0) budget.InterlockedMax(offset, combined.x, was);
+            if (combined.y > 0) budget.InterlockedAdd(offset + 4u, combined.y, was);
+        }
+#endif
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (!active) return;
+    bool over = cost > 0 && costs[gi] + cost > remaining;
+#else
     bool over = false;
     if (cost > 0) {
         uint before;
@@ -130,6 +214,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         over = before >= BUDGET || BUDGET - before < cost;
     }
+#endif
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -175,22 +260,74 @@ fn clamp() -> Option<&'static Clamp> {
 
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    make_for(device)
+    make_for_with(device, cfg!(feature = "diagnostics"), group_budget())
 }
 
-fn clamp_source(diagnostics: bool) -> String {
-    format!(
-        "#define VICTORY_DIAGNOSTICS {}\n{SOURCE}",
-        u8::from(diagnostics)
-    )
+/// Charge the indirect budget once per group and keep it in device-local
+/// memory when the adapter supports immediate writes. Off by default.
+pub(crate) fn group_budget() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_GROUP_BUDGET").is_some_and(|v| v == "1"))
 }
 
-fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    make_for_with(device, cfg!(feature = "diagnostics"))
+pub(crate) fn budget_writer(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+) -> Option<ID3D12GraphicsCommandList2> {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+    // SAFETY: writes the feature data to options, which has the given size.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS3,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .ok()?;
+    if !options.WriteBufferImmediateSupportFlags.contains(D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT) {
+        return None;
+    }
+    list.cast().ok()
 }
 
-fn make_for_with(device: &ID3D12Device, diagnostics: bool) -> windows::core::Result<Clamp> {
-    let source = clamp_source(diagnostics);
+/// Start a recording with a zero budget and leave it ready for the clamp.
+pub(crate) fn zero_card_budget(list: &ID3D12GraphicsCommandList2, buffer: &ID3D12Resource) {
+    // SAFETY: the direct list supports immediate writes and is open. The
+    // budget is in COMMON and every written word is within the buffer.
+    unsafe {
+        let at = buffer.GetGPUVirtualAddress();
+        let zeros = [0, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+            Dest: at + offset,
+            Value: 0,
+        });
+        list.ResourceBarrier(&[transition(
+            buffer,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
+        list.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
+        list.ResourceBarrier(&[transition(
+            buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
+    }
+}
+
+fn make_for_with(
+    device: &ID3D12Device,
+    diagnostics: bool,
+    grouped: bool,
+) -> windows::core::Result<Clamp> {
+    let source = format!(
+        "#define VICTORY_DIAGNOSTICS {}\n#define VICTORY_GROUP_BUDGET {}\n{SOURCE}",
+        u8::from(diagnostics),
+        u8::from(grouped)
+    );
+    compile_cs(device, &source)
+}
+
+fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -218,7 +355,7 @@ fn make_for_with(device: &ID3D12Device, diagnostics: bool) -> windows::core::Res
                     errors.GetBufferSize(),
                 )
             };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+            tracing::warn!("indirect shader: {}", String::from_utf8_lossy(text));
         }
         return Err(e);
     }
@@ -473,6 +610,231 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     };
 }
 
+/// Whether every draw served from a window is checked against a fresh
+/// clamp of its record (`VICTORY_INDIRECT_WINDOW_CHECK=1`, with
+/// `VICTORY_INDIRECT_WINDOW=1`; off by default). A window clamps its
+/// records once, ahead of their draws; if anything wrote a record between
+/// the window's clamp and its draw, the draw reads the old one. The check
+/// clamps the record again just before the draw (into a buffer of its own,
+/// charging a budget of its own) and compares the two on the card: the
+/// counts are logged ("window check"), and the first record that differs in
+/// each run of a list is named. For telling whether windows can be trusted
+/// in a scene before they are on by default; it costs a clamp and a compare
+/// per window draw.
+pub(crate) fn window_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// The compare of [`window_check`]: `words` dwords of the record a window
+/// clamped (`t0`) against the same record clamped just now (`t1`). Counts
+/// the checks and the records that differ in `u0`, keeps the first record
+/// that differs there (eight dwords of each), and zeroes the fresh clamp's
+/// own budget (`u1`) for the next check.
+const CHECK_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+cbuffer Check : register(b0) {
+    uint words;
+    uint window_offset;
+};
+ByteAddressBuffer window_record : register(t0);
+ByteAddressBuffer fresh_record : register(t1);
+RWByteAddressBuffer results : register(u0);
+RWByteAddressBuffer fresh_budget : register(u1);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    bool same = true;
+    for (uint i = 0; i < words; i++) {
+        if (window_record.Load(window_offset + 4 * i) != fresh_record.Load(4 * i)) {
+            same = false;
+        }
+    }
+    uint was;
+    results.InterlockedAdd(4, 1, was);
+    if (!same) {
+        uint before;
+        results.InterlockedAdd(0, 1, before);
+        if (before == 0) {
+            for (uint k = 0; k < min(words, 8u); k++) {
+                results.Store(8 + 4 * k, window_record.Load(window_offset + 4 * k));
+                results.Store(40 + 4 * k, fresh_record.Load(4 * k));
+            }
+        }
+    }
+    fresh_budget.Store3(0, uint3(0, 0, 0));
+    fresh_budget.Store2(12, uint2(0, 0));
+}
+"#;
+
+fn compare() -> Option<&'static Clamp> {
+    static COMPARE: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    COMPARE
+        .get_or_init(|| {
+            let device = &host()?.device;
+            match compile_cs(device, CHECK_SOURCE) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no window check");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+const WINDOW_CHECK_BYTES: u32 = 64 << 10;
+
+/// A list's buffers for [`window_check`]: the fresh clamps' records and
+/// budget, and the results (memory the CPU maps:
+/// records that differed, checks, then the first differing record as the
+/// window had it and as the fresh clamp made it, eight dwords each).
+pub(crate) struct WindowCheck {
+    args: ID3D12Resource,
+    budget: ID3D12Resource,
+    results: ID3D12Resource,
+    data: usize,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the mapping is read only at
+// submission, when the list's last run has finished.
+unsafe impl Send for WindowCheck {}
+// SAFETY: as above.
+unsafe impl Sync for WindowCheck {}
+
+impl WindowCheck {
+    pub(crate) fn new() -> Option<Self> {
+        let host = host()?;
+        let (results, data) = host.shared_buffer(256)?;
+        let (budget, budget_data) = host.shared_buffer(256)?;
+        // SAFETY: both mappings hold 256 bytes; nothing runs yet.
+        unsafe {
+            std::ptr::write_bytes(data, 0, 256);
+            std::ptr::write_bytes(budget_data, 0, 256);
+        }
+        Some(Self {
+            args: host.uav_buffer(WINDOW_CHECK_BYTES.into())?,
+            budget,
+            results,
+            data: data as usize,
+        })
+    }
+
+    /// What the list's last run found, zeroed for the next: checks, records
+    /// that differed, and the first that did (as the window had it, as the
+    /// fresh clamp made it). Only between runs of the list.
+    fn take(&self) -> (u32, u32, [u32; 8], [u32; 8]) {
+        let words = self.data as *mut u32;
+        // SAFETY: the list's own mapped words; its last run has finished.
+        unsafe {
+            let at = |k: usize| words.add(k).read_volatile();
+            let window = std::array::from_fn(|k| at(2 + k));
+            let fresh = std::array::from_fn(|k| at(10 + k));
+            let found = (at(1), at(0), window, fresh);
+            std::ptr::write_bytes(words, 0, 18);
+            found
+        }
+    }
+}
+
+/// Checks and differing records seen by [`window_check`] so far.
+static CHECKED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`window_check`] for a draw served from a window: the record of `kind`
+/// at `src`, `step` bytes long, which the window clamped into `scratch` at
+/// `at`, is clamped again into the list's check buffer and compared. Runs
+/// compute work of ours, so the caller binds its pipeline again after it.
+/// False if nothing was recorded.
+pub(crate) fn check_hit(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    (kind, step, ahead): (u32, u32, bool),
+    scratch: &ID3D12Resource,
+    at: u64,
+) -> bool {
+    const CHECK_USE: usize = usize::MAX - 0x78;
+    let Ok(at) = u32::try_from(at) else {
+        return false;
+    };
+    if step > WINDOW_CHECK_BYTES {
+        return false;
+    }
+    let (Some(c), Some(cmp), Some(check)) = (clamp(), compare(), list.window_check()) else {
+        return false;
+    };
+    if list.first_use(CHECK_USE) {
+        // At this recording's submission: what the list's last run found.
+        let check = std::sync::Arc::clone(check);
+        list.defer_host(move || {
+            let (checked, differed, window, fresh) = check.take();
+            if checked == 0 {
+                return;
+            }
+            use std::sync::atomic::Ordering::Relaxed;
+            let total = CHECKED[0].fetch_add(u64::from(checked), Relaxed) + u64::from(checked);
+            let bad = CHECKED[1].fetch_add(u64::from(differed), Relaxed) + u64::from(differed);
+            if differed > 0 {
+                tracing::warn!(
+                    differed,
+                    checked,
+                    ?window,
+                    ?fresh,
+                    "window check: a draw served from a window read a record that \
+                     differs from a fresh clamp of it"
+                );
+            }
+            if total / 10_000 != (total - u64::from(checked)) / 10_000 {
+                tracing::info!(checked = total, differed = bad, "window check");
+            }
+        });
+    }
+    // SAFETY: live buffers.
+    let (budget, results, fresh, window) = unsafe {
+        (
+            check.budget.GetGPUVirtualAddress(),
+            check.results.GetGPUVirtualAddress(),
+            check.args.GetGPUVirtualAddress(),
+            scratch.GetGPUVirtualAddress(),
+        )
+    };
+    // The record again, by the window's rules, into the check's buffer
+    // (common before and after every check).
+    let common = D3D12_RESOURCE_STATE_COMMON;
+    let spec = (kind, step, 1);
+    if !record_clamp_as(c, &list.list, &check.args, budget, src, None, spec, ahead) {
+        return false;
+    }
+    let args = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    let scratch_state = if list.indirect_kept(scratch) { args } else { common };
+    let constants = [step / 4, at];
+    // SAFETY: an open list and live buffers. Restore the window scratch to
+    // the state expected by the draw. Order the private budget and results
+    // UAV accesses even when the clamp's optional global waits are disabled.
+    unsafe {
+        list.list.ResourceBarrier(&[
+            uav_barrier(),
+            transition(scratch, scratch_state, read),
+            transition(&check.args, args, read),
+        ]);
+        list.list.SetComputeRootSignature(&cmp.root);
+        list.list.SetPipelineState(&cmp.pso);
+        list.list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+        list.list.SetComputeRootShaderResourceView(1, window);
+        list.list.SetComputeRootShaderResourceView(2, fresh);
+        list.list.SetComputeRootUnorderedAccessView(3, results);
+        list.list.SetComputeRootUnorderedAccessView(4, budget);
+        list.list.Dispatch(1, 1, 1);
+        list.list.ResourceBarrier(&[
+            uav_barrier(),
+            transition(scratch, read, scratch_state),
+            transition(&check.args, read, common),
+        ]);
+    }
+    true
+}
+
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -484,6 +846,9 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         },
     }
 }
+
+#[cfg(test)]
+mod bench;
 
 #[cfg(test)]
 mod tests {
@@ -547,7 +912,7 @@ void main() {
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
                 let clamp =
-                    make_for_with(&device, true).expect("clamp shader must compile on WARP");
+                    make_for_with(&device, true, group_budget()).expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
@@ -643,27 +1008,6 @@ void main() {
             buffer.unwrap()
         }
 
-        fn signature(&self, kind: u32, stride: u32) -> ID3D12CommandSignature {
-            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
-                Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-                ..Default::default()
-            };
-            let desc = D3D12_COMMAND_SIGNATURE_DESC {
-                ByteStride: stride,
-                NumArgumentDescs: 1,
-                pArgumentDescs: &arg,
-                NodeMask: 0,
-            };
-            let mut sig: Option<ID3D12CommandSignature> = None;
-            // SAFETY: valid single-argument command signature description.
-            unsafe {
-                self.device
-                    .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig)
-                    .unwrap();
-            }
-            sig.unwrap()
-        }
-
         fn submit_and_wait(&mut self) {
             self.submitted += 1;
             // SAFETY: closing, executing, waiting on fence, and resetting our list.
@@ -682,39 +1026,25 @@ void main() {
         }
     }
 
-    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
+    fn signature(device: &ID3D12Device, kind: u32, stride: u32) -> ID3D12CommandSignature {
+        let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &arg,
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        // SAFETY: valid single-argument command signature description.
         unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            })?;
-            Ok(Clamp { root, pso })
+            device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig)
+                .unwrap();
         }
+        sig.unwrap()
     }
 
     /// The compare of copies in the card's memory (`crate::host`), on the
@@ -1023,7 +1353,7 @@ void main() {
         let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer((STRIDE * 8) as u64);
         let dst_buf = warp.default_uav(u64::from(STRIDE) * u64::from(MAX));
-        let sig = warp.signature(KIND_DISPATCH, STRIDE);
+        let sig = signature(&warp.device, KIND_DISPATCH, STRIDE);
 
         // Fill the entire source buffer with non-zero sentinel bytes, then
         // populate 3 valid records at `ARGS_OFFSET` and 4,093 huge garbage
@@ -1303,7 +1633,7 @@ void main() {
         };
         const KIND_INDEXED: u32 = 1;
         const STRIDE: u32 = 24; // 5 indexed-draw words + 1 trailing custom word
-        const RECORDS: u32 = 128; // 2 waves of 64: old InterlockedAdd wrapped 2^32 at 64!
+        const RECORDS: u32 = 128; // Two groups of 64; an uncapped sum wraps at 64.
         const BUDGET_CAP: u32 = 1 << 27;
 
         let total_bytes = (STRIDE * RECORDS) as usize;
@@ -1467,7 +1797,7 @@ void main() {
             return;
         };
         let release_clamp =
-            make_for_with(&warp.device, false).expect("non-diagnostic clamp shader must compile");
+            make_for_with(&warp.device, false, group_budget()).expect("non-diagnostic clamp shader must compile");
 
         const KIND_COMPUTE: u32 = 2;
         const KIND_MESH: u32 = 10;
@@ -1534,6 +1864,247 @@ void main() {
                 "non-diagnostic shader must leave diagnostic budget words untouched"
             );
         }
+    }
+
+    /// A group charges its records in lane order: with 300 left of the
+    /// budget, the first draw (100) fits, the second (250) does not and
+    /// takes the rest, and the ones after it run empty. (Racing for the
+    /// word record by record, which of them fitted was up to the GPU.)
+    #[test]
+    fn warp_a_group_charges_its_records_in_lane_order() {
+        let Some(mut warp) = WarpHarness::new() else {
+            assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "WARP was requested");
+            return;
+        };
+        const KIND_DRAW: u32 = 0;
+        const STRIDE: u32 = 16;
+        const BUDGET_CAP: u32 = 1 << 27;
+        let mut counts = [0u32; 64];
+        // The result crosses the wave32 boundary within this group.
+        for (lane, count) in [(31, 100), (32, 250), (33, 50), (63, 100)] {
+            counts[lane] = count;
+        }
+        let total = counts.len() * STRIDE as usize;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
+        let dst_buf = warp.default_uav(total as u64);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            for (i, &count) in counts.iter().enumerate() {
+                let words = [count, 1, 7, 9];
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr().cast::<u8>(),
+                    src_ptr.add(i * STRIDE as usize),
+                    16,
+                );
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            (budget_ptr as *mut u32).write_volatile(BUDGET_CAP - 300);
+        }
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            &dst_buf,
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DRAW, STRIDE, counts.len() as u32),
+            false,
+        ));
+        // SAFETY: an open list; the clamped records are copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (spent, out) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4)
+                    .to_vec(),
+            )
+        };
+        let mut accepted = 0;
+        for (lane, (&asked, out)) in counts.iter().zip(out.chunks_exact(4)).enumerate() {
+            assert_eq!(out[2..], [7, 9]);
+            if asked == 0 || (group_budget() && lane == 31) {
+                assert_eq!(out[..2], [asked, 1], "lane {lane} fits");
+            } else if group_budget() {
+                assert_eq!(out[..2], [0, 0], "lane {lane} runs empty");
+            } else {
+                assert!(out[..2] == [0, 0] || out[..2] == [asked, 1]);
+            }
+            accepted += out[0];
+        }
+        assert!(accepted <= 300);
+        assert_eq!(spent, BUDGET_CAP, "the record that did not fit took the rest");
+    }
+
+    /// The list's budget starts empty at each submission, wherever it
+    /// lives (the card's copy is zeroed in the list): a recording whose
+    /// clamps spend all of it is followed, after the reset, by one whose
+    /// small record still runs.
+    #[test]
+    fn host_list_budget_starts_empty_at_each_submission() {
+        let Some(host) = super::host() else {
+            assert!(
+                !cfg!(feature = "diagnostics") || std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "WARP was requested"
+            );
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let _ = host.log_messages();
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let signature = signature(&host.device, KIND_DISPATCH, STRIDE);
+        // Three records of 65,535 x 16 groups: about half the budget each.
+        let (big, big_ptr) = host.shared_buffer(3 * u64::from(STRIDE)).unwrap();
+        let (small, small_ptr) = host.shared_buffer(u64::from(STRIDE)).unwrap();
+        let (hits_buf, hits_ptr) = host.shared_buffer(256).unwrap();
+        let (compute, compute_ptr) = host.shared_buffer(u64::from(STRIDE)).unwrap();
+        let (mesh, mesh_ptr) = host.shared_buffer(2 * u64::from(STRIDE)).unwrap();
+        // SAFETY: mapped buffers of these sizes; nothing runs yet.
+        unsafe {
+            big_ptr.cast::<[[u32; 3]; 3]>().write([[65_535, 16, 1]; 3]);
+            small_ptr.cast::<[u32; 3]>().write([1, 1, 1]);
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+            compute_ptr.cast::<[u32; 3]>().write([70_000, 1, 1]);
+            mesh_ptr.cast::<[[u32; 3]; 2]>().write([[11, 1, 1], [23, 1, 1]]);
+        }
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        let budget = list.budget().unwrap();
+        let execute_small = |scratch: &ID3D12Resource| {
+            // SAFETY: an open list; the worker's root signature and
+            // pipeline; buffers the test holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                list.list.ExecuteIndirect(&signature, 1, scratch, 0, None, 0);
+            }
+            done(&list, scratch);
+        };
+
+        // Spend the budget without executing the expensive records.
+        let scratch = bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+        done(&list, &scratch);
+        let scratch = bound(&list, (&compute, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        done(&list, &scratch);
+        let scratch = bound(&list, (&mesh, 0), None, (10, STRIDE, 2)).unwrap();
+        done(&list, &scratch);
+        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        execute_small(&scratch);
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        // SAFETY: execution finished and the buffer is mapped.
+        assert_eq!(unsafe { hits_ptr.cast::<u32>().read_volatile() }, 0);
+        #[cfg(feature = "diagnostics")]
+        {
+            let (mapped, notes) = list.indirect_budget_readback();
+            let card = group_budget() && budget_writer(&host.device, &list.list).is_some();
+            assert_eq!(budget != mapped, card);
+            assert_eq!(notes, [23, 34, 70_000, 1]);
+        }
+        list.reset();
+
+        // The first recording spent the budget, but the new recording
+        // starts with enough for the small dispatch.
+        assert_eq!(list.budget(), Some(budget));
+        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        execute_small(&scratch);
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(list.indirect_budget_readback().1, [0, 0, 1, 0]);
+        list.reset();
+        // SAFETY: the list has run; a mapped buffer.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, 1, "the budget starts empty at the next submission");
+    }
+
+    /// The window check: a record nothing wrote since its window clamped
+    /// it compares equal; one written on the card after the window's clamp
+    /// (an untracked writer) is found, and named as the window had it and
+    /// as it is now.
+    #[test]
+    fn host_list_window_check_finds_a_record_written_under_its_window() {
+        let Some(host) = super::host() else {
+            assert!(
+                !cfg!(feature = "diagnostics") || std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "WARP was requested"
+            );
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let _ = host.log_messages();
+        const KIND_DISPATCH: u32 = 2;
+        const STEP: u32 = 32;
+        let records = [[3u32, 1, 1], [5, 1, 1], [7, 1, 1], [9, 1, 1]];
+        let total = records.len() * STEP as usize;
+        let (src, src_ptr) = host.shared_buffer(total as u64).unwrap();
+        let (patch, patch_ptr) = host.shared_buffer(64).unwrap();
+        let (hits_buf, hits_ptr) = host.shared_buffer(256).unwrap();
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let signature = signature(&host.device, KIND_DISPATCH, 12);
+        // SAFETY: mapped buffers of these sizes; nothing runs yet.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0, total);
+            hits_ptr.cast::<u32>().write(0);
+            for (i, words) in records.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr().cast::<u8>(),
+                    src_ptr.add(i * STEP as usize),
+                    12,
+                );
+            }
+            std::ptr::copy_nonoverlapping([11u32, 2, 1].as_ptr().cast::<u8>(), patch_ptr, 12);
+        }
+        let spec = (KIND_DISPATCH, STEP, records.len() as u32);
+        let scratch = bound_ahead(&list, (&src, 0), spec).unwrap();
+        done(&list, &scratch);
+        // Record 0: nothing wrote it.
+        assert!(check_hit(&list, (&src, 0), (KIND_DISPATCH, STEP, true), &scratch, 0));
+        // Record 1 is written on the card after the window's clamp.
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        // SAFETY: an open list; `src` was read by the clamp (promoted to a
+        // shader read), `patch` is common; both live until the list has run.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(&src, read, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.list.CopyBufferRegion(&src, u64::from(STEP), &patch, 0, 12);
+            list.list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COPY_DEST, read)]);
+        }
+        let at = u64::from(STEP);
+        assert!(check_hit(&list, (&src, at), (KIND_DISPATCH, STEP, true), &scratch, at));
+        // Read the window's original record, as a window draw would.
+        // SAFETY: the window scratch is still readable as indirect arguments.
+        unsafe {
+            list.list.SetComputeRootSignature(&worker.root);
+            list.list.SetPipelineState(&worker.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, hits_buf.GetGPUVirtualAddress());
+            list.list.ExecuteIndirect(&signature, 1, &scratch, at, None, 0);
+        }
+        done(&list, &scratch);
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        // SAFETY: execution finished and the buffer is mapped.
+        assert_eq!(unsafe { hits_ptr.cast::<u32>().read_volatile() }, 5);
+        let (checked, differed, window, fresh) = list.window_check().unwrap().take();
+        list.reset();
+        assert_eq!((checked, differed), (2, 1), "two checks, the written record differs");
+        assert_eq!(window[..3], [5, 1, 1], "as the window clamped it");
+        assert_eq!(fresh[..3], [11, 2, 1], "as it is now");
     }
 
     /// `VICTORY_INDIRECT_KEEP`: the scratch stays in `INDIRECT_ARGUMENT`

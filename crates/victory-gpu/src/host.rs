@@ -792,9 +792,14 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// With grouped charging, the list's device-local budget and the
+    /// command list interface that zeroes it at the start of each run.
+    card_budget: OnceLock<Option<(ID3D12Resource, ID3D12GraphicsCommandList2)>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Fresh clamp and comparison buffers, allocated on the first window check.
+    window_check: OnceLock<Option<std::sync::Arc<crate::indirect::WindowCheck>>>,
     /// With [`fill_on_card`]: a device-local buffer constant buffer views of
     /// the list read, filled by copies on the card ([`HostList::card_constants`]):
     /// the buffer, the bytes used, and whether it is in the constant buffer
@@ -3395,7 +3400,9 @@ impl Host {
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                window_check: OnceLock::new(),
                 card_constants: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -5342,6 +5349,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.finish_card_budget();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5971,45 +5979,111 @@ impl HostList {
         scratch.chunks.iter().map(|c| c.1).sum()
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
+    /// The GPU address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
+        let card = if crate::indirect::group_budget() {
+            self.card_budget
+                .get_or_init(|| {
+                    let host = host()?;
+                    let writer = crate::indirect::budget_writer(&host.device, &self.list)?;
+                    let buffer = host.uav_buffer(256)?;
+                    name(&buffer, || "indirect budget".to_owned());
+                    Some((buffer, writer))
+                })
+                .as_ref()
+        } else {
+            None
+        };
+        let mapped = if card.is_none() || cfg!(feature = "diagnostics") {
+            Some(
+                self.budget
+                    .get_or_init(|| {
+                        let (b, d) = host()?.shared_buffer(256)?;
+                        if card.is_some() {
+                            // SAFETY: initialize the new readback mapping before its first read.
+                            unsafe { std::ptr::write_bytes(d, 0, 256) };
+                        }
+                        Some((b, d as usize))
+                    })
+                    .as_ref()?,
+            )
+        } else {
+            None
+        };
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped words, written before it runs.
-            // The words after the budget hold what the clamp noted about the
-            // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
-            deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                let words = at as *mut u32;
-                #[cfg(feature = "diagnostics")]
-                {
-                    let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
-                    MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
-                    MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                    // And of its indirect compute records: the largest x asked
-                    // for, and how many asked for more than a dispatch runs.
-                    let (widest, cut) = (words.add(3).read_volatile(), words.add(4).read_volatile());
-                    COMPUTE_GROUPS[0].fetch_max(u64::from(widest), Ordering::Relaxed);
-                    COMPUTE_GROUPS[1].fetch_add(u64::from(cut), Ordering::Relaxed);
-                    for k in 1..5 {
-                        words.add(k).write_volatile(0);
+            if let Some((_, at)) = mapped {
+                let at = *at;
+                // SAFETY: the list's own mapped words, written before it runs.
+                // The words after the budget hold its last run's diagnostics.
+                deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                    let words = at as *mut u32;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
+                        MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                        MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+                        // Indirect compute records: the largest x asked for
+                        // and how many asked for more than a dispatch runs.
+                        let (widest, cut) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                        COMPUTE_GROUPS[0].fetch_max(u64::from(widest), Ordering::Relaxed);
+                        COMPUTE_GROUPS[1].fetch_add(u64::from(cut), Ordering::Relaxed);
+                        for k in 1..5 {
+                            words.add(k).write_volatile(0);
+                        }
                     }
-                }
-                words.write_volatile(0);
-            })));
+                    words.write_volatile(0);
+                })));
+            }
+            if let Some((buffer, writer)) = card {
+                crate::indirect::zero_card_budget(writer, buffer);
+            }
         }
+        let buffer = card
+            .map(|(buffer, _)| buffer)
+            .or_else(|| mapped.map(|(buffer, _)| buffer))?;
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// Copy the diagnostic words for the next submission to read. Leave
+    /// the device-local budget in COMMON so the recording can run again.
+    fn finish_card_budget(&self) {
+        let Some(Some((card, _))) = self.card_budget.get() else {
+            return;
+        };
+        if !self.deferred().budget_zeroed {
+            return;
+        }
+        // SAFETY: an open list with its initialized budget. The mapped
+        // buffer is promoted from COMMON to COPY_DEST.
+        unsafe {
+            let state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            #[cfg(feature = "diagnostics")]
+            let state = if let Some(Some((mapped, _))) = self.budget.get() {
+                self.list.ResourceBarrier(&[transition(card, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            } else {
+                state
+            };
+            self.list.ResourceBarrier(&[transition(card, state, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn indirect_budget_readback(&self) -> (u64, [u32; 4]) {
+        let (buffer, data) = self.budget.get().unwrap().as_ref().unwrap();
+        let words = *data as *const u32;
+        // SAFETY: this list's mapped budget, read by tests after execution.
+        unsafe {
+            (
+                buffer.GetGPUVirtualAddress(),
+                std::array::from_fn(|i| words.add(i + 1).read_volatile()),
+            )
+        }
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -6046,8 +6120,7 @@ impl HostList {
         self.deferred().indirect_kept.remove(&(buffer.as_raw() as usize))
     }
 
-    /// Whether this list left `buffer` in `INDIRECT_ARGUMENT` (tests).
-    #[cfg(test)]
+    /// Whether this list left `buffer` in `INDIRECT_ARGUMENT`.
     pub(crate) fn indirect_kept(&self, buffer: &ID3D12Resource) -> bool {
         self.deferred().indirect_kept.contains(&(buffer.as_raw() as usize))
     }
@@ -6056,6 +6129,12 @@ impl HostList {
     /// execution read it.
     pub(crate) fn set_indirect_kept(&self, buffer: &ID3D12Resource) {
         self.deferred().indirect_kept.insert(buffer.as_raw() as usize);
+    }
+
+    pub(crate) fn window_check(&self) -> Option<&std::sync::Arc<crate::indirect::WindowCheck>> {
+        self.window_check
+            .get_or_init(|| crate::indirect::WindowCheck::new().map(std::sync::Arc::new))
+            .as_ref()
     }
 
     /// Keeps `object` alive until the list is reset.

@@ -447,6 +447,10 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // One interpolation mode per signature row, before the metadata
+        // and the container parts declare them.
+        container::unify_row_modes(&mut self.inputs, true);
+        container::unify_row_modes(&mut self.outputs, false);
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).

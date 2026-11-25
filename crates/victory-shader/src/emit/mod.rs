@@ -1556,6 +1556,11 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with(words, input_addr, false)
+    }
+
+    /// [`pixel`] with the attribute 16-bit (`fp16`) when `half` is set.
+    fn pixel_with(words: &[u32], input_addr: u32, half: bool) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1569,7 +1574,7 @@ mod barycentric_tests {
                     mask: 0b1111,
                     attr: 0,
                     flat: false,
-                    fp16: false,
+                    fp16: half,
                     pack2: false,
                     row2: 0,
                 }],
@@ -1610,6 +1615,32 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    /// A 16-bit write into the register an f16 first half left (its
+    /// second half went to another register) keeps that register's other
+    /// half, which holds nothing the program reads: the write must not
+    /// refuse the program (PS_DeferredTextured_c5fd36bb: v_interp_p1ll_f16
+    /// v8 at 0xc0, v_fma_mixlo_f16 v8 at 0x290, v8 read at 0x2d8).
+    #[test]
+    fn a_half_write_over_an_f16_first_half() {
+        let [e0, e1] = exp_mrt0(3);
+        let words = [
+            // v_interp_p1ll_f16 v3, v0, attr0.x
+            0xD742_0003,
+            0x0002_0000,
+            // v_interp_p2_f16 v4, v1, attr0.x, v3
+            0xD75A_0004,
+            0x040E_0200,
+            // v_fma_mixlo_f16 v3, v1, 1.0, 0
+            0xCC21_0003,
+            0x0201_E501,
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let shader = pixel_with(&words, PERSP_CENTER, true).unwrap();
+        validate(&shader);
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as

@@ -24,6 +24,49 @@ pub(crate) struct SigElement {
     pub half: bool,
 }
 
+/// Gives the elements sharing a signature row one interpolation mode, as
+/// DXIL requires ("interpolation mode that differs from another element
+/// packed into the same row"). The console packed rows whose elements the
+/// source declared alike; here each element's mode is chosen on its own
+/// (by type, or by how the program reads it), so an unread element can
+/// keep a default its row-mates do not share. The mode of the elements
+/// that are used wins when they agree; with none used, or on the output
+/// side when they disagree, a constant member makes the row constant (a
+/// float may be declared constant; an integer may not be interpolated).
+/// Rows whose used inputs disagree are left for the validator to name.
+pub(crate) fn unify_row_modes(elements: &mut [SigElement], inputs: bool) {
+    let rows: std::collections::BTreeSet<u32> = elements
+        .iter()
+        .filter(|e| e.interp != 0)
+        .filter_map(|e| e.row)
+        .collect();
+    for row in rows {
+        let members = |e: &SigElement| e.interp != 0 && e.row == Some(row);
+        let mut modes = elements.iter().filter(|e| members(e)).map(|e| e.interp);
+        let first = modes.next().unwrap_or(0);
+        if modes.all(|m| m == first) {
+            continue;
+        }
+        let used: std::collections::BTreeSet<u8> = elements
+            .iter()
+            .filter(|e| members(e) && e.usage != 0)
+            .map(|e| e.interp)
+            .collect();
+        let constant = elements.iter().any(|e| members(e) && e.interp == 1);
+        let target = match used.len() {
+            1 => used.first().copied(),
+            0 if constant => Some(1),
+            0 => None,
+            _ if !inputs && constant => Some(1),
+            _ => None,
+        };
+        let Some(target) = target else { continue };
+        for e in elements.iter_mut().filter(|e| members(e)) {
+            e.interp = target;
+        }
+    }
+}
+
 impl SigElement {
     fn system_value(&self) -> u32 {
         match self.kind {
@@ -72,7 +115,11 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows in element order too, with only the unallocated ones moved
+    // last. Sorting the rows by register instead fails ("Container part
+    // ... does not match expected") wherever the console lists an element
+    // before one in an earlier column of its row (TEXCOORD16 before
+    // TANGENT0, both in row 10: PS_MirrorReflectionDeferredPedTexturedNC).
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -90,7 +137,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.is_none());
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -399,6 +446,83 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn element(
+        name: &str,
+        index: u32,
+        kind: u8,
+        interp: u8,
+        row: u32,
+        col: u8,
+        cols: u8,
+        usage: u8,
+    ) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: if kind == 13 { 5 } else { 9 },
+            interp,
+            row: Some(row),
+            col,
+            cols,
+            usage,
+            half: false,
+        }
+    }
+
+    /// PS_PropFoliageDeferred_Fire_ExportDepth (999de9c4262184ce): an
+    /// unread TEXCOORD9 shares row 9 with the constant front face.
+    #[test]
+    fn an_unread_element_takes_its_row_mates_mode() {
+        let mut sig = vec![
+            element("TEXCOORD", 0, 0, 2, 1, 0, 4, 0xf),
+            element("TEXCOORD", 9, 0, 2, 9, 0, 1, 0),
+            element("SV_IsFrontFace", 0, 13, 1, 9, 1, 1, 1),
+        ];
+        unify_row_modes(&mut sig, true);
+        assert_eq!(sig.iter().map(|e| e.interp).collect::<Vec<_>>(), [2, 1, 1]);
+    }
+
+    #[test]
+    fn read_inputs_that_disagree_keep_their_modes() {
+        let mut sig = vec![
+            element("TEXCOORD", 0, 0, 2, 3, 0, 3, 0b111),
+            element("TEXCOORD", 1, 0, 1, 3, 3, 1, 1),
+        ];
+        unify_row_modes(&mut sig, true);
+        assert_eq!(sig.iter().map(|e| e.interp).collect::<Vec<_>>(), [2, 1]);
+    }
+
+    #[test]
+    fn an_output_row_with_a_constant_member_is_constant() {
+        // VS outputs: COLOR0 (uint, constant) and TEXCOORD22 (float) in row 14.
+        let mut sig = vec![
+            element("COLOR", 0, 0, 1, 14, 0, 1, 1),
+            element("TEXCOORD", 22, 0, 2, 14, 1, 2, 0b11),
+        ];
+        unify_row_modes(&mut sig, false);
+        assert_eq!(sig.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1]);
+    }
+
+    /// PS_MirrorReflectionDeferredPedTexturedNC (7e80c1635201799c) lists
+    /// TEXCOORD16 (row 10, w) before TANGENT0 (row 10, xyz); the part keeps
+    /// that order, as the validator's own serialisation does.
+    #[test]
+    fn signature_rows_keep_element_order() {
+        let sig = vec![
+            element("TEXCOORD", 16, 0, 2, 10, 3, 1, 1),
+            element("TANGENT", 0, 0, 2, 10, 0, 3, 0b111),
+        ];
+        let part = signature(&sig, true);
+        let row = |i: usize| u32::from_le_bytes(part[8 + 32 * i + 8..][..4].try_into().unwrap());
+        assert_eq!(
+            (row(0), row(1)),
+            (16, 0),
+            "semantic indices in element order"
+        );
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {
